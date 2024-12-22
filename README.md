@@ -16,7 +16,7 @@ Follow these simple steps to set up SRT AI Translator and start enjoying better 
 
 ### Prerequisites
 
-- An OpenAI API key (grab it [here](https://platform.openai.com/account/api-keys), if you don't have one already)
+- A Gemini AI Key (grab it [here](https://aistudio.google.com/), if you don't have one already)
 - Node.js and npm installed on your machine
 
 ### Installation
