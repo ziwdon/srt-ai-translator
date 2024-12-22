@@ -1,21 +1,18 @@
 import { groupSegmentsByTokenLength } from "@/lib/srt";
 import { parseSegment } from "@/lib/client";
-import OpenAI from "openai";
+import { google } from "@ai-sdk/google";
+import { generateText } from "ai";
 
 export const dynamic = "force-dynamic";
 
 const MAX_TOKENS_IN_SEGMENT = 700;
 
-const openai = new OpenAI({
-	apiKey: process.env.OPENAI_API_KEY,
-});
-
 const retrieveTranslation = async (text: string, language: string) => {
 	let retries = 3;
 	while (retries > 0) {
 		try {
-			const response = await openai.chat.completions.create({
-				model: "gpt-4o-mini",
+			const { text: translatedText } = await generateText({
+				model: google("gemini-2.0-flash-exp"),
 				messages: [
 					{
 						role: "system",
@@ -27,10 +24,9 @@ const retrieveTranslation = async (text: string, language: string) => {
 						content: `Translate this to ${language}: ${text}`,
 					},
 				],
-				stream: true,
 			});
 
-			return response;
+			return translatedText;
 		} catch (error) {
 			console.error("Translation error:", error);
 			if (retries > 1) {
@@ -57,33 +53,16 @@ export async function POST(request: Request) {
 			async start(controller) {
 				for (const group of groups) {
 					const text = group.map((segment) => segment.text).join("|");
-					const response = await retrieveTranslation(text, language);
-					if (!response) continue;
+					const translatedText = await retrieveTranslation(text, language);
+					if (!translatedText) continue;
 
-					let currentSegment = "";
-					for await (const chunk of response) {
-						const content = chunk.choices[0]?.delta?.content || "";
-						if (content) {
-							currentSegment += content;
-							if (content.includes("|")) {
-								const translatedSegments = currentSegment.split("|");
-								for (const segment of translatedSegments.slice(0, -1)) {
-									if (segment.trim()) {
-										const originalSegment = segments[currentIndex];
-										const srt = `${++currentIndex}\n${originalSegment?.timestamp || ""}\n${segment.trim()}\n\n`;
-										controller.enqueue(encoder.encode(srt));
-									}
-								}
-								currentSegment =
-									translatedSegments[translatedSegments.length - 1];
-							}
+					const translatedSegments = translatedText.split("|");
+					for (const segment of translatedSegments) {
+						if (segment.trim()) {
+							const originalSegment = segments[currentIndex];
+							const srt = `${++currentIndex}\n${originalSegment?.timestamp || ""}\n${segment.trim()}\n\n`;
+							controller.enqueue(encoder.encode(srt));
 						}
-					}
-
-					if (currentSegment.trim()) {
-						const originalSegment = segments[currentIndex];
-						const srt = `${++currentIndex}\n${originalSegment?.timestamp || ""}\n${currentSegment.trim()}\n\n`;
-						controller.enqueue(encoder.encode(srt));
 					}
 				}
 				controller.close();
