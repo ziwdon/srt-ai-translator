@@ -4,29 +4,21 @@ import React, { FormEvent, useState } from "react";
 import Image from "next/image";
 
 interface Props {
-  onSubmit: (content: string, language: string) => void;
+  onSubmit: (content: string, language: string, filename: string) => void;
 }
 function classNames(...classes: any[]) {
   return classes.filter(Boolean).join(" ");
 }
 
-const LANGUAGES = [
-  'Traditional Chinese', 'Simplified Chinese', 'Spanish', 'English', 'Hindi', 'Bengali', 'Portuguese', 'Russian',
-  'Japanese', 'Punjabi', 'Marathi', 'Telugu', 'Wu Chinese', 'Turkish', 'Korean',
-  'French', 'German', 'Vietnamese', 'Tamil', 'Yue Chinese', 'Urdu', 'Javanese', 'Italian', 'Icelandic',
-  'Arabic', 'Gujarati', 'Persian', 'Bhojpuri', 'Min Nan', 'Hakka',
-  'Jin Chinese', 'Hausa', 'Kannada', 'Indonesian', 'Polish', 'Yoruba', 'Xiang Chinese',
-  'Malayalam', 'Odia', 'Maithili', 'Burmese', 'Sunda', 'Ukrainian',
-  'Igbo', 'Uzbek', 'Sindhi', 'Romanian', 'Tagalog', 'Dutch', 'Estonian',
-  'Danish', 'Finnish', 'Norwegian', 'Swedish',
-  'Amharic', 'Pashto', 'Magahi', 'Thai', 'Saraiki', 'Khmer',
-  'Somali', 'Malay', 'Cebuano', 'Nepali', 'Assamese', 'Sinhalese',
-  'Kurdish', 'Fulfulde', 'Greek', 'Chittagonian', 'Kazakh', 'Hungarian',
-  'Kinyarwanda', 'Zulu', 'Czech', 'Uyghur', 'Hmong', 'Shona',
-  'Quechua', 'Belarusian', 'Balochi', 'Konkani', 'Armenian', 'Azerbaijani',
-  'Bashkir', 'Luxembourgish', 'Tibetan', 'Tigrinya', 'Turkmen', 'Kashmiri',
-  'Malagasy', 'Kirghiz', 'Tatar', 'Tonga', 'Tswana', 'Esperanto'
-].sort()
+// Limited set of predefined languages in specific order (without sorting)
+const PREDEFINED_LANGUAGES = [
+  'English',
+  'Portuguese (Portugal)', 
+  'Spanish (Spain)'
+];
+
+// Special value to indicate custom language selection
+const CUSTOM_LANGUAGE_OPTION = "custom";
 
 const readFileContents = async (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
@@ -47,14 +39,21 @@ const readFileContents = async (file: File): Promise<string> => {
 
 const SrtForm: React.FC<Props> = ({ onSubmit }) => {
   const [file, setFile] = useState<File>();
-  const [language, setLanguage] = useState<string>("");
+  const [selectedOption, setSelectedOption] = useState<string>("");
+  const [customLanguage, setCustomLanguage] = useState<string>("");
   const [dragging, setDragging] = useState<boolean>(false);
+
+  // Get the final language value (either selected from dropdown or custom input)
+  const getLanguage = () => {
+    return selectedOption === CUSTOM_LANGUAGE_OPTION ? customLanguage : selectedOption;
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    const language = getLanguage();
     if (file && language) {
       const content = await readFileContents(file);
-      onSubmit(content, language);
+      onSubmit(content, language, file.name);
     }
   };
 
@@ -151,31 +150,48 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
               htmlFor="srt-file"
               className="block font-bold md:pl-8 mt-6 md:mt-2 py-4 text-lg text-[#444444]"
             >
-              {language ? "✅" : "👉"} Step 2: Select a Target language
+              {getLanguage() ? "✅" : "👉"} Step 2: Select a Target language
             </label>
-            <div className="rounded-lg bg-[#fafafa] text-[#444444] py-4 md:py-8 md:px-8 relative md:flex items-center text-center md:text-left">
+            <div className="rounded-lg bg-[#fafafa] text-[#444444] py-4 md:py-8 md:px-8 relative md:flex flex-wrap items-center text-center md:text-left">
               <div>Translate this SRT file to</div>
-              <select
-                id="language"
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-                className="px-4 py-2 mt-4 ml-2 bg-white rounded-lg border border-gray-300 md:mt-0"
-              >
-                <option value="">Choose language&hellip;</option>
-                {LANGUAGES.map((lang, i) => (
-                  <option key={i} value={lang}>
-                    {lang}
-                  </option>
-                ))}
-              </select>
+              
+              <div className="flex flex-col md:flex-row items-center mt-4 md:mt-0 md:ml-2 w-full md:w-auto">
+                <select
+                  id="language"
+                  value={selectedOption}
+                  onChange={(e) => setSelectedOption(e.target.value)}
+                  className="px-4 py-2 bg-white rounded-lg border border-gray-300 w-full md:w-auto"
+                >
+                  <option value="">Choose language&hellip;</option>
+                  {PREDEFINED_LANGUAGES.map((lang, i) => (
+                    <option key={i} value={lang}>
+                      {lang}
+                    </option>
+                  ))}
+                  <option value={CUSTOM_LANGUAGE_OPTION}>Custom language...</option>
+                </select>
+                
+                {/* Show custom language input only when "Custom language..." is selected */}
+                {selectedOption === CUSTOM_LANGUAGE_OPTION && (
+                  <input
+                    type="text"
+                    id="customLanguage"
+                    value={customLanguage}
+                    onChange={(e) => setCustomLanguage(e.target.value)}
+                    placeholder="Enter language name..."
+                    className="px-4 py-2 mt-2 md:mt-0 md:ml-2 bg-white rounded-lg border border-gray-300 w-full md:w-auto"
+                    autoFocus
+                  />
+                )}
+              </div>
             </div>
             <div className="h-2"></div>
           </div>
           <button
-            disabled={!file || !language}
+            disabled={!file || !getLanguage()}
             className="bg-[#444444] hover:bg-[#3a3a3a] text-white mt-6 font-bold py-2 px-6 rounded-lg disabled:bg-[#eeeeee] disabled:text-[#aaaaaa]"
           >
-            Translate {language ? `to ${language}` : `SRT`} &rarr;
+            Translate {getLanguage() ? `to ${getLanguage()}` : `SRT`} &rarr;
           </button>
         </>
       )}

@@ -37,6 +37,7 @@ export default function Home() {
 	const [translatedSrt, setTranslatedSrt] = React.useState("");
 	const [translatedChunks, setTranslatedChunks] = React.useState<Chunk[]>([]);
 	const [originalChunks, setOriginalChunks] = React.useState<Chunk[]>([]);
+	const [file, setFile] = React.useState<File | null>(null);
 
 	async function handleStream(response: Response) {
 		const data = response.body;
@@ -67,7 +68,7 @@ export default function Home() {
 		}
 	}
 
-	async function handleSubmit(content: string, language: string) {
+	async function handleSubmit(content: string, language: string, filename: string) {
 		try {
 			if (!content) {
 				console.error("No content provided");
@@ -120,11 +121,40 @@ export default function Home() {
 			});
 
 			if (response.ok) {
-				const content = await handleStream(response);
-				const filename = `${language}.srt`;
-				if (content) {
+				const translatedContent = await handleStream(response);
+				
+				// Define all known suffixes
+				const knownSuffixes = ['.eng', '.spa', '.pop'];
+				
+				// First, remove any existing known suffix from the filename
+				let baseName = filename.replace(/\.srt$/i, '');
+				
+				// Check if the filename already ends with one of the known suffixes
+				for (const suffix of knownSuffixes) {
+					if (baseName.toLowerCase().endsWith(suffix.toLowerCase())) {
+						// Remove the suffix from the base name
+						baseName = baseName.slice(0, -suffix.length);
+						break;
+					}
+				}
+				
+				// Determine the language suffix based on the selected language
+				let languageSuffix = "";
+				if (language === "Spanish (Spain)") {
+					languageSuffix = ".spa";
+				} else if (language === "English") {
+					languageSuffix = ".eng";
+				} else if (language === "Portuguese (Portugal)") {
+					languageSuffix = ".pop";
+				}
+				// For custom languages, no suffix is added
+				
+				// Create the new filename with the appropriate suffix
+				const outputFilename = `${baseName}${languageSuffix}.srt`;
+				
+				if (translatedContent) {
 					setStatus("done");
-					triggerFileDownload(filename, content);
+					triggerFileDownload(outputFilename, translatedContent);
 				} else {
 					setStatus("idle");
 					alert("Error occurred while reading the file");
@@ -194,7 +224,15 @@ export default function Home() {
 						All done!
 					</h1>
 					<p>Check your "Downloads" folder 🍿</p>
-					<p className="mt-4 text-[#444444]">
+					<p>
+						<br />{" "}
+						<a
+							href="/"
+						>
+							Translate another file 🔄
+						</a>
+					</p>
+					<p className="mt-10 text-[#444444]">
 						Psst. Need to edit your SRT? Try{" "}
 						<a
 							href="https://www.veed.io/subtitle-tools/edit?locale=en&source=/tools/subtitle-editor/srt-editor"
@@ -204,6 +242,7 @@ export default function Home() {
 							this tool
 						</a>
 					</p>
+					
 				</>
 			)}
 		</main>

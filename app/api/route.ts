@@ -12,16 +12,29 @@ const retrieveTranslation = async (text: string, language: string) => {
 	while (retries > 0) {
 		try {
 			const { text: translatedText } = await generateText({
-				model: google("gemini-2.0-flash-exp"),
+				model: google("gemini-2.0-flash"),
 				messages: [
 					{
 						role: "system",
 						content:
-							"You are an experienced semantic translator, specialized in creating SRT files. Separate translation segments with the '|' symbol",
+							`You are an experienced semantic translator, specialized in creating SRT files. 
+							You strictly abide by the following rules: 
+							
+							Maintain the original grammatical person (first, second, or third person) exactly as in the source language. Do not shift between persons unless grammatically unavoidable.  
+
+							If the source text uses "you" (singular or plural), ensure the translation keeps the same grammatical person and formality level. Avoid translating second-person sentences into third-person ones unless grammatically unavoidable. 
+							
+							Ensure verb conjugations and pronouns align perfectly with the original speaker's perspective. Do not modify them to match another language's common conventions. 
+
+							Pay close attention to direct and indirect pronouns, ensuring they preserve their meaning and grammatical function. 
+
+							If the original text uses informal or formal address, reflect this precisely in the translation without altering the intended register. 
+							
+							Separate translation segments with the '|' symbol`,
 					},
 					{
 						role: "user",
-						content: `Translate this to ${language}: ${text}`,
+						content: `Translate the following text to ${language} while strictly abiding by the rules: ${text}`,
 					},
 				],
 			});
