@@ -38,6 +38,29 @@ export default function Home() {
 	const [translatedChunks, setTranslatedChunks] = React.useState<Chunk[]>([]);
 	const [originalChunks, setOriginalChunks] = React.useState<Chunk[]>([]);
 	const [file, setFile] = React.useState<File | null>(null);
+	const [configOk, setConfigOk] = React.useState<boolean | null>(null);
+	const [configMessage, setConfigMessage] = React.useState<string | null>(null);
+
+	React.useEffect(() => {
+		(async () => {
+			try {
+				const res = await fetch("/api/config");
+				const data = await res.json();
+				if (data?.ok) {
+					setConfigOk(true);
+				} else {
+					setConfigOk(false);
+					setConfigMessage(
+						data?.message ||
+							"Missing GOOGLE_GENERATIVE_AI_API_KEY. Set it in Netlify env or .env.local.",
+					);
+				}
+			} catch (e) {
+				setConfigOk(false);
+				setConfigMessage("Unable to verify configuration.");
+			}
+		})();
+	}, []);
 
 	async function handleStream(response: Response) {
 		const data = response.body;
@@ -181,7 +204,22 @@ export default function Home() {
 				libre.className,
 			)}
 		>
-			{status === "idle" && (
+			{configOk === false && (
+				<>
+					<h1
+						className={classNames(
+							"px-4 text-3xl md:text-5xl text-center font-bold my-6",
+							roaldDahl.className,
+						)}
+					>
+						Configuration error
+					</h1>
+					<p className="px-4 text-center">
+						{configMessage}
+					</p>
+				</>
+			)}
+			{configOk !== false && status === "idle" && (
 				<>
 					<h1
 						className={classNames(
@@ -194,7 +232,7 @@ export default function Home() {
 					<Form onSubmit={handleSubmit} />
 				</>
 			)}
-			{status === "busy" && (
+			{configOk !== false && status === "busy" && (
 				<>
 					<h1
 						className={classNames(
@@ -213,7 +251,7 @@ export default function Home() {
 					/>
 				</>
 			)}
-			{status === "done" && (
+			{configOk !== false && status === "done" && (
 				<>
 					<h1
 						className={classNames(
