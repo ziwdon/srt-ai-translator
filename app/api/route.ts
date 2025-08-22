@@ -55,6 +55,15 @@ const retrieveTranslation = async (text: string, language: string) => {
 
 export async function POST(request: Request) {
 	try {
+		if (!process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
+			return new Response(
+				JSON.stringify({
+					error:
+						"Missing GOOGLE_GENERATIVE_AI_API_KEY. Set it in Netlify env or .env.local.",
+				}),
+				{ status: 500 },
+			);
+		}
 		const { content, language } = await request.json();
 		const segments = content.split(/\r\n\r\n|\n\n/).map(parseSegment);
 		const groups = groupSegmentsByTokenLength(segments, MAX_TOKENS_IN_SEGMENT);
