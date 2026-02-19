@@ -4,6 +4,8 @@ import { google } from "@ai-sdk/google";
 import { generateText } from "ai";
 
 export const dynamic = "force-dynamic";
+// Platforms that support this can allow longer-running batches.
+export const maxDuration = 300;
 
 const MAX_TOKENS_IN_SEGMENT = 700;
 const MAX_RETRIES = 3;

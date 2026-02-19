@@ -7,11 +7,18 @@ import { libre, roaldDahl } from "@/fonts";
 import Form from "@/components/Form";
 import Timestamp from "@/components/Timestamp";
 
-import type { Chunk } from "@/types";
+import type { Chunk, Segment } from "@/types";
 import { parseSegment, parseTimestamp } from "@/lib/client";
+import { groupSegmentsByTokenLength } from "@/lib/srt";
 
 function classNames(...classes: string[]) {
 	return classes.filter(Boolean).join(" ");
+}
+
+const MAX_TOKENS_PER_TRANSLATION_REQUEST = 700;
+
+function serializeSegment(segment: Segment): string {
+	return `${segment.id}\n${segment.timestamp}\n${segment.text}`;
 }
 
 const triggerFileDownload = (filename: string, content: string) => {
@@ -64,32 +71,82 @@ export default function Home() {
 		})();
 	}, []);
 
-	async function handleStream(response: Response) {
+	async function handleStream(response: Response): Promise<{
+		content: string;
+		translatedSegmentCount: number;
+	}> {
 		const data = response.body;
-		if (!data) return;
+		if (!data) {
+			throw new Error("Translation response body is missing.");
+		}
 
 		let content = "";
-		let doneReading = false;
+		let translatedSegmentCount = 0;
+		let pending = "";
 		const reader = data.getReader();
 		const decoder = new TextDecoder();
 
-		while (!doneReading) {
+		const appendChunkToPreview = (incomingText: string) => {
+			const blocks = incomingText.split(/\r?\n\r?\n/);
+			pending = blocks.pop() ?? "";
+			const parsedChunks: Chunk[] = [];
+
+			for (const block of blocks) {
+				const normalizedBlock = block.trim();
+				if (!normalizedBlock) {
+					continue;
+				}
+
+				translatedSegmentCount += 1;
+				const { id, timestamp, text } = parseSegment(normalizedBlock);
+				if (!Number.isFinite(id) || !timestamp.includes(" --> ") || !text.trim()) {
+					continue;
+				}
+
+				const { start, end } = parseTimestamp(timestamp);
+				parsedChunks.push({ index: id.toString(), start, end, text });
+			}
+
+			if (parsedChunks.length) {
+				setTranslatedChunks((prev) => [...prev, ...parsedChunks]);
+			}
+		};
+
+		while (true) {
 			const { value, done } = await reader.read();
-			doneReading = done;
-			const chunk = decoder.decode(value);
+			if (done) {
+				break;
+			}
 
-			content += `${chunk}\n\n`;
-			if (chunk.trim().length)
-				setTranslatedChunks((prev) => [...prev, parseChunk(chunk)]);
+			const chunk = decoder.decode(value, { stream: true });
+			if (!chunk) {
+				continue;
+			}
+
+			content += chunk;
+			appendChunkToPreview(pending + chunk);
 		}
 
-		return content;
-
-		function parseChunk(chunkStr: string): Chunk {
-			const { id, timestamp, text } = parseSegment(chunkStr);
-			const { start, end } = parseTimestamp(timestamp);
-			return { index: id.toString(), start, end, text };
+		const finalChunk = decoder.decode();
+		if (finalChunk) {
+			content += finalChunk;
+			appendChunkToPreview(pending + finalChunk);
 		}
+
+		const trailingBlock = pending.trim();
+		if (trailingBlock) {
+			translatedSegmentCount += 1;
+			const { id, timestamp, text } = parseSegment(trailingBlock);
+			if (Number.isFinite(id) && timestamp.includes(" --> ") && text.trim()) {
+				const { start, end } = parseTimestamp(timestamp);
+				setTranslatedChunks((prev) => [
+					...prev,
+					{ index: id.toString(), start, end, text },
+				]);
+			}
+		}
+
+		return { content, translatedSegmentCount };
 	}
 
 	async function handleSubmit(content: string, language: string, filename: string) {
@@ -120,8 +177,19 @@ export default function Home() {
 				return;
 			}
 
+			let originalSegments: Segment[] = [];
 			try {
-				const originalSegments = segments.map(parseSegment);
+				originalSegments = segments
+					.map(parseSegment)
+					.filter(
+						(segment) =>
+							Number.isFinite(segment.id) &&
+							Boolean(segment.timestamp?.includes(" --> ")) &&
+							Boolean(segment.text?.trim()),
+					);
+				if (!originalSegments.length) {
+					throw new Error("No valid subtitle segments found.");
+				}
 				setOriginalChunks(
 					originalSegments.map((seg) => ({
 						index: seg.id.toString(),
@@ -137,59 +205,87 @@ export default function Home() {
 				return;
 			}
 
-			const response = await fetch("/api", {
-				method: "POST",
-				body: JSON.stringify({ content, language }),
-				headers: { "Content-Type": "application/json" },
-			});
+			const requestGroups = groupSegmentsByTokenLength(
+				originalSegments,
+				MAX_TOKENS_PER_TRANSLATION_REQUEST,
+			);
 
-			if (response.ok) {
-				const translatedContent = await handleStream(response);
-				
-				// Define all known suffixes
-				const knownSuffixes = ['.eng', '.spa', '.pop'];
-				
-				// First, remove any existing known suffix from the filename
-				let baseName = filename.replace(/\.srt$/i, '');
-				
-				// Check if the filename already ends with one of the known suffixes
-				for (const suffix of knownSuffixes) {
-					if (baseName.toLowerCase().endsWith(suffix.toLowerCase())) {
-						// Remove the suffix from the base name
-						baseName = baseName.slice(0, -suffix.length);
-						break;
-					}
+			let translatedContent = "";
+			let translatedSegmentCount = 0;
+
+			for (const requestGroup of requestGroups) {
+				const requestContent = requestGroup.map(serializeSegment).join("\n\n");
+				const response = await fetch("/api", {
+					method: "POST",
+					body: JSON.stringify({ content: requestContent, language }),
+					headers: { "Content-Type": "application/json" },
+				});
+
+				if (!response.ok) {
+					const errorText = await response.text().catch(() => "");
+					throw new Error(
+						errorText || "Error occurred while submitting the translation request",
+					);
 				}
-				
-				// Determine the language suffix based on the selected language
-				let languageSuffix = "";
-				if (language === "Spanish (Spain)") {
-					languageSuffix = ".spa";
-				} else if (language === "English") {
-					languageSuffix = ".eng";
-				} else if (language === "Portuguese (Portugal)") {
-					languageSuffix = ".pop";
+
+				const batchResult = await handleStream(response);
+				if (batchResult.translatedSegmentCount !== requestGroup.length) {
+					throw new Error(
+						`Incomplete translation batch. Expected ${requestGroup.length}, received ${batchResult.translatedSegmentCount}.`,
+					);
 				}
-				// For custom languages, no suffix is added
-				
-				// Create the new filename with the appropriate suffix
-				const outputFilename = `${baseName}${languageSuffix}.srt`;
-				
-				if (translatedContent) {
-					setStatus("done");
-					triggerFileDownload(outputFilename, translatedContent);
-				} else {
-					setStatus("idle");
-					alert("Error occurred while reading the file");
+
+				translatedSegmentCount += batchResult.translatedSegmentCount;
+				translatedContent += `${batchResult.content.trimEnd()}\n\n`;
+			}
+
+			if (translatedSegmentCount !== originalSegments.length) {
+				throw new Error(
+					`Incomplete translation. Expected ${originalSegments.length}, received ${translatedSegmentCount}.`,
+				);
+			}
+
+			// Define all known suffixes
+			const knownSuffixes = [".eng", ".spa", ".pop"];
+
+			// First, remove any existing known suffix from the filename
+			let baseName = filename.replace(/\.srt$/i, "");
+
+			// Check if the filename already ends with one of the known suffixes
+			for (const suffix of knownSuffixes) {
+				if (baseName.toLowerCase().endsWith(suffix.toLowerCase())) {
+					// Remove the suffix from the base name
+					baseName = baseName.slice(0, -suffix.length);
+					break;
 				}
+			}
+
+			// Determine the language suffix based on the selected language
+			let languageSuffix = "";
+			if (language === "Spanish (Spain)") {
+				languageSuffix = ".spa";
+			} else if (language === "English") {
+				languageSuffix = ".eng";
+			} else if (language === "Portuguese (Portugal)") {
+				languageSuffix = ".pop";
+			}
+			// For custom languages, no suffix is added
+
+			// Create the new filename with the appropriate suffix
+			const outputFilename = `${baseName}${languageSuffix}.srt`;
+
+			if (translatedContent.trim()) {
+				setStatus("done");
+				triggerFileDownload(outputFilename, translatedContent);
 			} else {
 				setStatus("idle");
-				console.error(
-					"Error occurred while submitting the translation request",
-				);
+				alert("Error occurred while reading the translated output.");
 			}
 		} catch (error) {
 			setStatus("idle");
+			alert(
+				"Translation did not complete. Please retry with the latest app version.",
+			);
 			console.error(
 				"Error during file reading and translation request:",
 				error,
