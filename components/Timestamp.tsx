@@ -3,15 +3,14 @@ import "tailwindcss/tailwind.css";
 import type { Chunk } from "@/types";
 
 const Timestamp: FC<Chunk & { originalText?: string }> = ({
-	index,
 	start,
 	end,
 	text,
 	originalText,
 }) => {
 	const formatTimestamp = (timestamp: string) => {
-		let [hours, minutes, secondsWithMs] = timestamp.split(":");
-		const [seconds, ms] = secondsWithMs.split(",");
+		const [, minutes = "00", secondsWithMs = "00,000"] = timestamp.split(":");
+		const [seconds = "00", ms = "000"] = secondsWithMs.split(",");
 
 		return `${minutes}:${seconds}.${ms[0]}`;
 	};

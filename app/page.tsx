@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import Link from "next/link";
 import { libre, roaldDahl } from "@/fonts";
 
 import Form from "@/components/Form";
@@ -16,10 +17,13 @@ function classNames(...classes: string[]) {
 const triggerFileDownload = (filename: string, content: string) => {
 	const element = document.createElement("a");
 	const file = new Blob([content], { type: "text/plain" });
-	element.href = URL.createObjectURL(file);
+	const fileUrl = URL.createObjectURL(file);
+	element.href = fileUrl;
 	element.download = filename;
 	document.body.appendChild(element);
 	element.click();
+	element.remove();
+	URL.revokeObjectURL(fileUrl);
 };
 
 function Translating({ chunks }: { chunks: Chunk[] }) {
@@ -34,10 +38,8 @@ function Translating({ chunks }: { chunks: Chunk[] }) {
 
 export default function Home() {
 	const [status, setStatus] = React.useState<"idle" | "busy" | "done">("idle");
-	const [translatedSrt, setTranslatedSrt] = React.useState("");
 	const [translatedChunks, setTranslatedChunks] = React.useState<Chunk[]>([]);
 	const [originalChunks, setOriginalChunks] = React.useState<Chunk[]>([]);
-	const [file, setFile] = React.useState<File | null>(null);
 	const [configOk, setConfigOk] = React.useState<boolean | null>(null);
 	const [configMessage, setConfigMessage] = React.useState<string | null>(null);
 
@@ -55,7 +57,7 @@ export default function Home() {
 							"Missing GOOGLE_GENERATIVE_AI_API_KEY. Set it in Netlify env or .env.local.",
 					);
 				}
-			} catch (e) {
+			} catch {
 				setConfigOk(false);
 				setConfigMessage("Unable to verify configuration.");
 			}
@@ -77,7 +79,6 @@ export default function Home() {
 			const chunk = decoder.decode(value);
 
 			content += `${chunk}\n\n`;
-			setTranslatedSrt((prev) => prev + chunk);
 			if (chunk.trim().length)
 				setTranslatedChunks((prev) => [...prev, parseChunk(chunk)]);
 		}
@@ -100,7 +101,6 @@ export default function Home() {
 
 			setStatus("busy");
 			// Reset previous state
-			setTranslatedSrt("");
 			setTranslatedChunks([]);
 			setOriginalChunks([]);
 
@@ -242,7 +242,7 @@ export default function Home() {
 					>
 						Translating&hellip;
 					</h1>
-					<p>(The file will automatically download when it's done)</p>
+					<p>(The file will automatically download when it&apos;s done)</p>
 					<Translating
 						chunks={translatedChunks.map((chunk, i) => ({
 							...chunk,
@@ -261,14 +261,12 @@ export default function Home() {
 					>
 						All done!
 					</h1>
-					<p>Check your "Downloads" folder 🍿</p>
+					<p>Check your &quot;Downloads&quot; folder 🍿</p>
 					<p>
 						<br />{" "}
-						<a
-							href="/"
-						>
+						<Link href="/">
 							Translate another file 🔄
-						</a>
+						</Link>
 					</p>
 					<p className="mt-10 text-[#444444]">
 						Psst. Need to edit your SRT? Try{" "}

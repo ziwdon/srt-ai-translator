@@ -1,4 +1,4 @@
-export default async (request, context) => {
+const basicAuth = async (request, context) => {
   const username = Netlify.env.get("BASIC_AUTH_USER");
   const password = Netlify.env.get("BASIC_AUTH_PASS");
 
@@ -34,10 +34,12 @@ export default async (request, context) => {
     if (providedUser === username && providedPass === password) {
       return context.next();
     }
-  } catch (_) {
+  } catch {
     return unauthorized();
   }
 
   return unauthorized();
 };
+
+export default basicAuth;
 

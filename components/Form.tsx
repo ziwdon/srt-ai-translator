@@ -6,7 +6,7 @@ import Image from "next/image";
 interface Props {
   onSubmit: (content: string, language: string, filename: string) => void;
 }
-function classNames(...classes: any[]) {
+function classNames(...classes: string[]) {
   return classes.filter(Boolean).join(" ");
 }
 
@@ -45,7 +45,9 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
 
   // Get the final language value (either selected from dropdown or custom input)
   const getLanguage = () => {
-    return selectedOption === CUSTOM_LANGUAGE_OPTION ? customLanguage : selectedOption;
+    return selectedOption === CUSTOM_LANGUAGE_OPTION
+      ? customLanguage.trim()
+      : selectedOption;
   };
 
   const handleSubmit = async (e: FormEvent) => {
@@ -66,7 +68,7 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
 
       // Make sure the file extension is ".srt"
       const fileName = droppedFile.name;
-      const fileExtension = fileName.split(".").pop();
+      const fileExtension = fileName.split(".").pop()?.toLowerCase();
       if (fileExtension !== "srt") {
         alert("Please upload a .srt file");
         return;
@@ -101,7 +103,7 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
         <input
           type="file"
           accept=".srt"
-          onChange={(e) => setFile(e.target.files![0])}
+          onChange={(e) => setFile(e.target.files?.[0])}
           className="absolute inset-0 opacity-0 cursor-pointer"
         />
         <div
