@@ -5,4 +5,22 @@
 html,
 body {
   margin: 0;
+  min-height: 100%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background:
+    radial-gradient(circle at 15% 20%, rgba(191, 219, 254, 0.45), transparent 34%),
+    radial-gradient(circle at 85% 8%, rgba(199, 210, 254, 0.5), transparent 36%),
+    linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
+  color: #0f172a;
+}
+
+::selection {
+  background: rgba(99, 102, 241, 0.2);
+  color: #0f172a;
 }

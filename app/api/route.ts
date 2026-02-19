@@ -12,6 +12,7 @@ const MAX_RETRIES = 3;
 const TRANSLATION_DELIMITER = "|||SRT_SEGMENT|||";
 const MODEL_NAME = "gemini-2.0-flash";
 const TRANSLATION_DELIMITER_CORE = TRANSLATION_DELIMITER.replace(/^\|+|\|+$/g, "");
+const SEGMENT_BLOCK_SPLIT_REGEX = /\r?\n\s*\r?\n/;
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -92,12 +93,9 @@ const retrieveTranslation = async (
 
 			const translatedSegments = splitTranslatedSegments(translatedText);
 
-			if (
-				translatedSegments.length !== expectedSegments ||
-				translatedSegments.some((segment) => !segment)
-			) {
+			if (translatedSegments.length !== expectedSegments) {
 				throw new Error(
-					`Unexpected translated output shape. Expected ${expectedSegments} non-empty segments, received ${translatedSegments.length}.`,
+					`Unexpected translated output shape. Expected ${expectedSegments} segments, received ${translatedSegments.length}.`,
 				);
 			}
 
@@ -138,14 +136,14 @@ export async function POST(request: Request) {
 
 		const { content, language } = payload;
 		const segments = content
-			.split(/\r\n\r\n|\n\n/)
+			.split(SEGMENT_BLOCK_SPLIT_REGEX)
+			.map((segment) => segment.trim())
+			.filter(Boolean)
 			.map(parseSegment)
-			.filter(
-				(segment) =>
-					Number.isFinite(segment.id) &&
-					Boolean(segment.timestamp?.includes(" --> ")) &&
-					Boolean(segment.text?.trim()),
-			);
+			.map((segment, index) => ({
+				...segment,
+				id: Number.isFinite(segment.id) && segment.id > 0 ? segment.id : index + 1,
+			}));
 
 		if (!segments.length) {
 			return new Response(
@@ -163,9 +161,7 @@ export async function POST(request: Request) {
 			async start(controller) {
 				try {
 					for (const group of groups) {
-						const text = group
-							.map((segment) => segment.text.trim())
-							.join(TRANSLATION_DELIMITER);
+						const text = group.map((segment) => segment.text).join(TRANSLATION_DELIMITER);
 						const translatedSegments = await retrieveTranslation(
 							text,
 							language,

@@ -6,7 +6,8 @@ Translate SRT files to any language, using AI magic ✨
 
 Say goodbye to subpar auto-generated captions and elevate the user experience with high-quality translations! 🎉
 
-> **Disclaimer:** This is originally a fork of [yazinsai/srt-ai](https://github.com/yazinsai/srt-ai).<br>
+> **Disclaimer:** This project is originally a fork of [yazinsai/srt-ai](https://github.com/yazinsai/srt-ai).<br>
+> The codebase itself has been reworked and improved from its original version using AI.<br>
 > This version highlights three main selectable languages: English, Spanish (Spain), and Portuguese (Portugal).<br>
 > It also includes a custom field where users can manually enter any other language for translation.<br>
 > Additionally, the AI prompt has been improved to ensure consistent person and register across translations.

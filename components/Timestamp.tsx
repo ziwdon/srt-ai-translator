@@ -1,8 +1,8 @@
 import React, { FC } from "react";
-import "tailwindcss/tailwind.css";
 import type { Chunk } from "@/types";
 
 const Timestamp: FC<Chunk & { originalText?: string }> = ({
+	index,
 	start,
 	end,
 	text,
@@ -16,32 +16,38 @@ const Timestamp: FC<Chunk & { originalText?: string }> = ({
 	};
 
 	return (
-		<div className="flex">
-			<div className="flex flex-col items-center">
-				<div className="flex items-center mb-1">
-					<span className="text-xl">⏲</span>
-					<p className="ml-2 text-gray-400">{formatTimestamp(start)}</p>
+		<article className="rounded-2xl border border-slate-200 bg-white/90 p-4 shadow-sm">
+			<div className="flex flex-wrap items-center justify-between gap-2">
+				<div className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+					<span>{formatTimestamp(start)}</span>
+					<span className="text-slate-400">-&gt;</span>
+					<span>{formatTimestamp(end)}</span>
 				</div>
-				<div className="flex items-center">
-					<span className="text-xl">⏲</span>
-					<p className="ml-2 text-gray-400">{formatTimestamp(end)}</p>
+				<div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-500">
+					Segment {index}
 				</div>
 			</div>
-			<div className="flex-grow flex gap-4 ml-4">
+
+			<div
+				className={`mt-3 grid gap-3 ${originalText ? "md:grid-cols-2" : "grid-cols-1"}`}
+			>
 				{originalText && (
-					<textarea
-						className="flex-grow h-full bg-gray-100 p-2 rounded-lg text-gray-500"
-						value={originalText}
-						readOnly
-					/>
+					<div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+						<p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+							Original
+						</p>
+						<p className="whitespace-pre-wrap text-sm text-slate-600">{originalText}</p>
+					</div>
 				)}
-				<textarea
-					className="flex-grow h-full bg-gray-200 p-2 rounded-lg"
-					value={text}
-					readOnly
-				/>
+
+				<div className="rounded-xl border border-indigo-100 bg-indigo-50/60 p-3">
+					<p className="mb-2 text-xs font-semibold uppercase tracking-wide text-indigo-500">
+						Translated
+					</p>
+					<p className="whitespace-pre-wrap text-sm text-slate-700">{text}</p>
+				</div>
 			</div>
-		</div>
+		</article>
 	);
 };
 
