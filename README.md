@@ -33,3 +33,13 @@ Follow these simple steps to set up SRT AI Translator and start enjoying better 
 4. Start locally using `npm run dev`
 
 You should now be able to access the repo at [`http://localhost:3000/`](http://localhost:3000/) in your browser.
+
+### Optional: Netlify Basic Auth
+
+This project includes an optional Netlify Edge Function for HTTP Basic Auth.
+To enable it in Netlify, set the following Environment Variables:
+
+- `BASIC_AUTH_USER`
+- `BASIC_AUTH_PASS`
+
+If these variables are not set, the app remains publicly accessible.
