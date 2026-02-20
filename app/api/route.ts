@@ -10,7 +10,7 @@ export const maxDuration = 300;
 const MAX_TOKENS_IN_SEGMENT = 700;
 const MAX_RETRIES = 3;
 const TRANSLATION_DELIMITER = "|||SRT_SEGMENT|||";
-const MODEL_NAME = "gemini-2.0-flash";
+const MODEL_NAME = "gemini-3-flash-preview";
 const TRANSLATION_DELIMITER_CORE = TRANSLATION_DELIMITER.replace(/^\|+|\|+$/g, "");
 const SEGMENT_BLOCK_SPLIT_REGEX = /\r?\n\s*\r?\n/;
 
