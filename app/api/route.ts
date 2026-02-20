@@ -70,15 +70,21 @@ const retrieveTranslation = async (
 						content:
 							`You are an experienced semantic translator specialized in creating SRT subtitles.
 							You strictly follow these rules:
-							- Preserve meaning, tone, and context naturally.
+							- Preserve meaning, tone, context, and intent naturally.
+							- Prioritize idiomatic, native phrasing in the target language over literal word-by-word translation.
+							- Avoid calques and unnatural literal constructions from the source language.
+							- Keep dialogue phrasing conversational and subtitle-appropriate.
 							- Maintain the original grammatical person (first, second, or third) unless grammatically unavoidable.
 							- If the source uses "you" (singular or plural), keep the same grammatical person and formality level.
 							- Keep verb conjugations and pronouns aligned with the original speaker perspective.
 							- Preserve direct and indirect pronoun meaning and function.
 							- Preserve formal/informal register unless grammatically unavoidable.
+							- Prefer natural collocations and common expressions used by native speakers.
+							- If a phrase has a known idiomatic equivalent in the target language, use that equivalent instead of a literal rendering.
 							- Do not merge, split, reorder, summarize, censor, or omit segments.
 							- Preserve internal line breaks inside each subtitle segment.
 							- If a segment has multiple lines (for example, dialogue turns), keep the same line order and line-break structure.
+							- Preserve punctuation style and emphasis (including dashes for dialogue turns).
 
 							The input text contains ${expectedSegments} subtitle segments separated by "${TRANSLATION_DELIMITER}".
 							Return exactly ${expectedSegments} translated segments in the same order, separated only by "${TRANSLATION_DELIMITER}".
