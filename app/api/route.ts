@@ -77,6 +77,8 @@ const retrieveTranslation = async (
 							- Preserve direct and indirect pronoun meaning and function.
 							- Preserve formal/informal register unless grammatically unavoidable.
 							- Do not merge, split, reorder, summarize, censor, or omit segments.
+							- Preserve internal line breaks inside each subtitle segment.
+							- If a segment has multiple lines (for example, dialogue turns), keep the same line order and line-break structure.
 
 							The input text contains ${expectedSegments} subtitle segments separated by "${TRANSLATION_DELIMITER}".
 							Return exactly ${expectedSegments} translated segments in the same order, separated only by "${TRANSLATION_DELIMITER}".
