@@ -14,7 +14,7 @@ function classNames(...classes: string[]) {
 	return classes.filter(Boolean).join(" ");
 }
 
-const MAX_TOKENS_PER_TRANSLATION_REQUEST = 700;
+const DEFAULT_MAX_TOKENS_PER_TRANSLATION_REQUEST = 350;
 const SEGMENT_BLOCK_SPLIT_REGEX = /\r?\n\s*\r?\n/;
 const MAX_BATCH_RETRIES = 5;
 const BASE_BACKOFF_DELAY_MS = 1000;
@@ -75,7 +75,9 @@ function getRetryDelayMs(attempt: number): number {
 async function requestTranslationBatch(
 	content: string,
 	language: string,
+	runId: string,
 	requestNumber: number,
+	totalRequests: number,
 ): Promise<Response> {
 	let lastError: Error | null = null;
 
@@ -85,7 +87,12 @@ async function requestTranslationBatch(
 			response = await fetch("/api", {
 				method: "POST",
 				body: JSON.stringify({ content, language }),
-				headers: { "Content-Type": "application/json" },
+				headers: {
+					"Content-Type": "application/json",
+					"x-translation-run-id": runId,
+					"x-translation-request-number": String(requestNumber),
+					"x-translation-total-requests": String(totalRequests),
+				},
 			});
 		} catch (error) {
 			lastError =
@@ -205,6 +212,8 @@ export default function Home() {
 	const [originalChunks, setOriginalChunks] = React.useState<Chunk[]>([]);
 	const [configOk, setConfigOk] = React.useState<boolean | null>(null);
 	const [configMessage, setConfigMessage] = React.useState<string | null>(null);
+	const [maxTokensPerTranslationRequest, setMaxTokensPerTranslationRequest] =
+		React.useState<number>(DEFAULT_MAX_TOKENS_PER_TRANSLATION_REQUEST);
 	const [progress, setProgress] =
 		React.useState<TranslationProgress>(EMPTY_PROGRESS);
 	const [activeFilename, setActiveFilename] = React.useState<string>("");
@@ -229,6 +238,13 @@ export default function Home() {
 			try {
 				const res = await fetch("/api/config");
 				const data = await res.json();
+				const configuredTokenLimit =
+					typeof data?.maxTokensPerRequest === "number" &&
+					Number.isFinite(data.maxTokensPerRequest) &&
+					data.maxTokensPerRequest > 0
+						? data.maxTokensPerRequest
+						: DEFAULT_MAX_TOKENS_PER_TRANSLATION_REQUEST;
+				setMaxTokensPerTranslationRequest(configuredTokenLimit);
 				if (data?.ok) {
 					setConfigOk(true);
 				} else {
@@ -391,7 +407,7 @@ export default function Home() {
 
 			const requestGroups = groupSegmentsByTokenLength(
 				originalSegments,
-				MAX_TOKENS_PER_TRANSLATION_REQUEST,
+				maxTokensPerTranslationRequest,
 			);
 
 			setProgress({
@@ -404,6 +420,7 @@ export default function Home() {
 
 			let translatedContent = "";
 			let translatedSegmentCount = 0;
+			const translationRunId = crypto.randomUUID();
 
 			for (let requestIndex = 0; requestIndex < requestGroups.length; requestIndex += 1) {
 				const requestGroup = requestGroups[requestIndex];
@@ -416,7 +433,9 @@ export default function Home() {
 				const response = await requestTranslationBatch(
 					requestContent,
 					language,
+					translationRunId,
 					requestIndex + 1,
+					requestGroups.length,
 				);
 
 				const batchResult = await handleStream(response, () => {
