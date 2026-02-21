@@ -39,7 +39,8 @@ Environment variables:
 - Optional model: `GEMINI_MODEL_NAME` (default: `gemini-3-flash-preview`)
 - Optional request batch size: `GEMINI_BATCH_TOKENS` (default: `350`, recommended range: `300-400` for Gemini 3)
 - Optional thinking level (Gemini 3): `GEMINI_THINKING_LEVEL` (`minimal`, `low`, `medium`, `high`; default: `low`)
-- Optional Netlify-priority overrides: `NETLIFY_GEMINI_MODEL_NAME`, `NETLIFY_GEMINI_BATCH_TOKENS`, `NETLIFY_GEMINI_THINKING_LEVEL`
+
+Use the same variable names in Netlify site environment settings.
 
 You should now be able to access the repo at [`http://localhost:3000/`](http://localhost:3000/) in your browser.
 

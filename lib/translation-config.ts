@@ -34,16 +34,11 @@ function isGeminiThinkingLevel(value: string): value is GeminiThinkingLevel {
 }
 
 export function resolveTranslationRuntimeConfig(): TranslationRuntimeConfigResult {
-	// Netlify-specific overrides come first so they can explicitly win over generic keys.
 	const modelName =
-		getFirstDefinedEnvValue(["NETLIFY_GEMINI_MODEL_NAME", "GEMINI_MODEL_NAME"]) ||
-		DEFAULT_GEMINI_MODEL_NAME;
+		getFirstDefinedEnvValue(["GEMINI_MODEL_NAME"]) || DEFAULT_GEMINI_MODEL_NAME;
 	const isGemini3Model = modelName.startsWith("gemini-3");
 
-	const thinkingLevelRaw = getFirstDefinedEnvValue([
-		"NETLIFY_GEMINI_THINKING_LEVEL",
-		"GEMINI_THINKING_LEVEL",
-	]);
+	const thinkingLevelRaw = getFirstDefinedEnvValue(["GEMINI_THINKING_LEVEL"]);
 	let thinkingLevel: GeminiThinkingLevel = DEFAULT_GEMINI_THINKING_LEVEL;
 	if (thinkingLevelRaw) {
 		if (!isGeminiThinkingLevel(thinkingLevelRaw)) {
@@ -61,10 +56,7 @@ export function resolveTranslationRuntimeConfig(): TranslationRuntimeConfigResul
 		thinkingLevel = thinkingLevelRaw;
 	}
 
-	const batchTokenLimitRaw = getFirstDefinedEnvValue([
-		"NETLIFY_GEMINI_BATCH_TOKENS",
-		"GEMINI_BATCH_TOKENS",
-	]);
+	const batchTokenLimitRaw = getFirstDefinedEnvValue(["GEMINI_BATCH_TOKENS"]);
 
 	let maxTokensPerRequest = DEFAULT_GEMINI_BATCH_TOKENS;
 	if (batchTokenLimitRaw) {
