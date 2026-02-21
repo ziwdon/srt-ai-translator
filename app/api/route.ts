@@ -9,31 +9,61 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 const MAX_RETRIES = 3;
-const TRANSLATION_DELIMITER = "|||SRT_SEGMENT|||";
 const MODEL_CALL_TIMEOUT_MS = 55_000;
-const TRANSLATION_DELIMITER_CORE = TRANSLATION_DELIMITER.replace(/^\|+|\|+$/g, "");
 const SEGMENT_BLOCK_SPLIT_REGEX = /\r?\n\s*\r?\n/;
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function splitTranslatedSegments(rawText: string): string[] {
+function splitTranslatedSegments(rawText: string, delimiter: string): string[] {
+	const delimiterCore = delimiter.replace(/^\|+|\|+$/g, "");
 	const normalizedText = rawText.replace(/\r\n/g, "\n").trim();
 	const permissiveDelimiter = new RegExp(
-		`["'“”‘’]?\\|{3}\\s*${escapeRegExp(TRANSLATION_DELIMITER_CORE)}\\s*\\|{3}["'“”‘’]?`,
+		`["'“”‘’]?\\|{3}\\s*${escapeRegExp(delimiterCore)}\\s*\\|{3}["'“”‘’]?`,
 		"g",
 	);
 
 	// Normalize harmless delimiter formatting drift before strict split/count checks.
 	const delimiterNormalizedText = normalizedText.replace(
 		permissiveDelimiter,
-		TRANSLATION_DELIMITER,
+		delimiter,
 	);
 
 	return delimiterNormalizedText
-		.split(TRANSLATION_DELIMITER)
+		.split(delimiter)
 		.map((segment) => segment.trim());
+}
+
+function normalizeTranslatedSegmentCount(
+	segments: string[],
+	expectedSegments: number,
+): string[] {
+	if (segments.length === expectedSegments) {
+		return segments;
+	}
+
+	// Some model responses include harmless leading/trailing delimiters.
+	const withoutBoundaryEmpties = [...segments];
+	while (withoutBoundaryEmpties[0]?.length === 0) {
+		withoutBoundaryEmpties.shift();
+	}
+	while (withoutBoundaryEmpties[withoutBoundaryEmpties.length - 1]?.length === 0) {
+		withoutBoundaryEmpties.pop();
+	}
+
+	if (withoutBoundaryEmpties.length === expectedSegments) {
+		return withoutBoundaryEmpties;
+	}
+
+	const withoutAllEmpties = withoutBoundaryEmpties.filter(
+		(segment) => segment.length > 0,
+	);
+	if (withoutAllEmpties.length === expectedSegments) {
+		return withoutAllEmpties;
+	}
+
+	return segments;
 }
 
 function parsePayload(payload: unknown): { content: string; language: string } | null {
@@ -104,6 +134,7 @@ type TranslationRequestContext = {
 	batchLabel: string;
 	groupIndex: number;
 	totalGroups: number;
+	translationDelimiter: string;
 	modelName: string;
 	thinkingLevel: "minimal" | "low" | "medium" | "high";
 	isGemini3Model: boolean;
@@ -168,11 +199,11 @@ const retrieveTranslation = async (
 							- If a segment has multiple lines (for example, dialogue turns), keep the same line order and line-break structure.
 							- Preserve punctuation style and emphasis (including dashes for dialogue turns).
 
-							The input text contains ${expectedSegments} subtitle segments separated by "${TRANSLATION_DELIMITER}".
-							Return exactly ${expectedSegments} translated segments in the same order, separated only by "${TRANSLATION_DELIMITER}".
+							The input text contains ${expectedSegments} subtitle segments separated by "${context.translationDelimiter}".
+							Return exactly ${expectedSegments} translated segments in the same order, separated only by "${context.translationDelimiter}".
 							Output only translated segment text.
 							Never add numbering, timestamps, markdown, code fences, or explanations.
-							Never include "${TRANSLATION_DELIMITER}" inside any translated segment.`,
+							Never include "${context.translationDelimiter}" inside any translated segment.`,
 					},
 					{
 						role: "user",
@@ -181,7 +212,10 @@ const retrieveTranslation = async (
 				],
 			});
 
-			const translatedSegments = splitTranslatedSegments(translatedText);
+			const translatedSegments = normalizeTranslatedSegmentCount(
+				splitTranslatedSegments(translatedText, context.translationDelimiter),
+				expectedSegments,
+			);
 
 			if (translatedSegments.length !== expectedSegments) {
 				throw new Error(
@@ -347,7 +381,10 @@ export async function POST(request: Request) {
 				try {
 					for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
 						const group = groups[groupIndex];
-						const text = group.map((segment) => segment.text).join(TRANSLATION_DELIMITER);
+						const translationDelimiter = `|||SRT_SEGMENT_${crypto
+							.randomUUID()
+							.replace(/-/g, "")}|||`;
+						const text = group.map((segment) => segment.text).join(translationDelimiter);
 						const translatedSegments = await retrieveTranslation(
 							text,
 							language,
@@ -357,6 +394,7 @@ export async function POST(request: Request) {
 								batchLabel,
 								groupIndex: groupIndex + 1,
 								totalGroups: groups.length,
+								translationDelimiter,
 								modelName: runtimeConfig.modelName,
 								thinkingLevel: runtimeConfig.thinkingLevel,
 								isGemini3Model: runtimeConfig.isGemini3Model,
