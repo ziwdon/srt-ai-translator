@@ -4,10 +4,11 @@ import React from "react";
 import { libre, roaldDahl } from "@/fonts";
 
 import Form from "@/components/Form";
+import OffsetForm from "@/components/OffsetForm";
 import Timestamp from "@/components/Timestamp";
 
 import type { Chunk, Segment } from "@/types";
-import { parseSegment, parseTimestamp } from "@/lib/client";
+import { parseSegment, parseTimestamp, applyOffsetToTimestampLine } from "@/lib/client";
 import { groupSegmentsByTokenLength } from "@/lib/srt";
 
 function classNames(...classes: string[]) {
@@ -22,6 +23,7 @@ const MAX_BACKOFF_DELAY_MS = 12000;
 const INTER_BATCH_DELAY_MS = 150;
 const RETRIABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 type TranslationStatus = "idle" | "busy" | "done";
+type AppMode = "translate" | "offset";
 
 type TranslationProgress = {
 	totalSegments: number;
@@ -220,6 +222,8 @@ export default function Home() {
 	const [activeLanguage, setActiveLanguage] = React.useState<string>("");
 	const [startedAt, setStartedAt] = React.useState<number | null>(null);
 	const [elapsedSeconds, setElapsedSeconds] = React.useState<number>(0);
+	const [activeMode, setActiveMode] = React.useState<AppMode>("translate");
+	const [activeOffsetMs, setActiveOffsetMs] = React.useState<number>(0);
 
 	React.useEffect(() => {
 		if (status !== "busy" || startedAt === null) {
@@ -273,6 +277,7 @@ export default function Home() {
 		setOriginalChunks([]);
 		setActiveFilename("");
 		setActiveLanguage("");
+		setActiveOffsetMs(0);
 		resetRunState();
 	}, [resetRunState]);
 
@@ -531,6 +536,46 @@ export default function Home() {
 		}
 	}
 
+	function handleOffset(content: string, offsetMs: number, filename: string) {
+		if (!content) {
+			console.error("No content provided");
+			return;
+		}
+
+		try {
+			const blocks = splitSrtBlocks(content);
+			if (!blocks.length) {
+				alert("Invalid SRT file format. Please check your file.");
+				return;
+			}
+
+			const segments = normalizeSegmentIds(blocks.map(parseSegment));
+			if (!segments.length) {
+				alert("No valid subtitle segments found.");
+				return;
+			}
+
+			const offsetContent =
+				segments
+					.map((segment) => {
+						const newTimestamp = applyOffsetToTimestampLine(
+							segment.timestamp,
+							offsetMs,
+						);
+						return `${segment.id}\n${newTimestamp}\n${segment.text}`;
+					})
+					.join("\n\n") + "\n";
+
+			setActiveFilename(filename);
+			setActiveOffsetMs(offsetMs);
+			setStatus("done");
+			triggerFileDownload(filename, offsetContent);
+		} catch (error) {
+			alert("Error processing SRT file. Please check the file format.");
+			console.error("Offset processing error:", error);
+		}
+	}
+
 	const segmentProgress = toPercent(
 		progress.translatedSegments,
 		progress.totalSegments,
@@ -539,15 +584,29 @@ export default function Home() {
 		progress.completedRequests,
 		progress.totalRequests,
 	);
-	const titleByStatus: Record<TranslationStatus, string> = {
-		idle: "Translate any SRT to any language",
-		busy: "Translating subtitles in real time",
-		done: "Translation complete",
+	const titles: Record<AppMode, Record<TranslationStatus, string>> = {
+		translate: {
+			idle: "Translate any SRT to any language",
+			busy: "Translating subtitles in real time",
+			done: "Translation complete",
+		},
+		offset: {
+			idle: "Adjust subtitle timing with precision",
+			busy: "Applying time offset",
+			done: "Time offset applied",
+		},
 	};
-	const subtitleByStatus: Record<TranslationStatus, string> = {
-		idle: "Drop a subtitle file, pick a language, and get a polished translation with automatic download.",
-		busy: "You can track both segment-level and request-level progress while translated lines stream in.",
-		done: "Your file has been downloaded. Start a new translation whenever you are ready.",
+	const subtitleTexts: Record<AppMode, Record<TranslationStatus, string>> = {
+		translate: {
+			idle: "Drop a subtitle file, pick a language, and get a polished translation with automatic download.",
+			busy: "You can track both segment-level and request-level progress while translated lines stream in.",
+			done: "Your file has been downloaded. Start a new translation whenever you are ready.",
+		},
+		offset: {
+			idle: "Upload an SRT file and apply a positive or negative millisecond offset to every timestamp.",
+			busy: "Processing your file...",
+			done: "Your file has been downloaded with adjusted timestamps. Process another file whenever you are ready.",
+		},
 	};
 
 	if (configOk === false) {
@@ -602,11 +661,39 @@ export default function Home() {
 									roaldDahl.className,
 								)}
 							>
-								{titleByStatus[status]}
+								{titles[activeMode][status]}
 							</h1>
 							<p className="max-w-3xl text-sm text-slate-600 md:text-base">
-								{subtitleByStatus[status]}
+								{subtitleTexts[activeMode][status]}
 							</p>
+							{status === "idle" && (
+								<div className="inline-flex gap-1 rounded-xl bg-slate-100 p-1">
+									<button
+										type="button"
+										onClick={() => setActiveMode("translate")}
+										className={classNames(
+											"rounded-lg px-4 py-2 text-sm font-semibold transition",
+											activeMode === "translate"
+												? "bg-white text-slate-900 shadow-sm"
+												: "text-slate-500 hover:text-slate-700",
+										)}
+									>
+										Translate
+									</button>
+									<button
+										type="button"
+										onClick={() => setActiveMode("offset")}
+										className={classNames(
+											"rounded-lg px-4 py-2 text-sm font-semibold transition",
+											activeMode === "offset"
+												? "bg-white text-slate-900 shadow-sm"
+												: "text-slate-500 hover:text-slate-700",
+										)}
+									>
+										Time Offset
+									</button>
+								</div>
+							)}
 						</div>
 						{status === "busy" && (
 							<p className="inline-flex items-center rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700">
@@ -622,9 +709,14 @@ export default function Home() {
 					</section>
 				)}
 
-				{configOk === true && status === "idle" && <Form onSubmit={handleSubmit} />}
+				{configOk === true && status === "idle" && activeMode === "translate" && (
+					<Form onSubmit={handleSubmit} />
+				)}
+				{configOk === true && status === "idle" && activeMode === "offset" && (
+					<OffsetForm onSubmit={handleOffset} />
+				)}
 
-				{configOk === true && status === "busy" && (
+				{configOk === true && status === "busy" && activeMode === "translate" && (
 					<>
 						<section className="rounded-3xl border border-slate-200 bg-white/85 p-6 shadow-xl backdrop-blur md:p-8">
 							<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -717,14 +809,19 @@ export default function Home() {
 						<div className="grid gap-5 md:grid-cols-[1.3fr_0.7fr] md:items-center">
 							<div>
 								<p className="text-xs font-semibold uppercase tracking-wide text-emerald-600">
-									Translation complete
+									{activeMode === "translate"
+										? "Translation complete"
+										: "Time offset applied"}
 								</p>
 								<h2 className="mt-2 text-2xl font-bold text-slate-900 md:text-3xl">
-									Your translated subtitle file has been downloaded.
+									{activeMode === "translate"
+										? "Your translated subtitle file has been downloaded."
+										: "Your time-adjusted subtitle file has been downloaded."}
 								</h2>
 								<p className="mt-3 text-sm text-slate-600">
-									Use the action buttons to run another translation or edit your
-									SRT file before continuing.
+									{activeMode === "translate"
+										? "Use the action buttons to run another translation or edit your SRT file before continuing."
+										: "Use the action buttons to process another file or edit your SRT file."}
 								</p>
 								<div className="mt-4 flex flex-wrap gap-2">
 									{activeFilename && (
@@ -732,14 +829,22 @@ export default function Home() {
 											File: {activeFilename}
 										</span>
 									)}
-									{activeLanguage && (
+									{activeMode === "translate" && activeLanguage && (
 										<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
 											Language: {activeLanguage}
 										</span>
 									)}
-									<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
-										Duration: {formatElapsedTime(elapsedSeconds)}
-									</span>
+									{activeMode === "offset" && activeOffsetMs !== 0 && (
+										<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+											Offset: {activeOffsetMs > 0 ? "+" : ""}
+											{activeOffsetMs} ms
+										</span>
+									)}
+									{activeMode === "translate" && (
+										<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+											Duration: {formatElapsedTime(elapsedSeconds)}
+										</span>
+									)}
 								</div>
 							</div>
 
@@ -749,7 +854,9 @@ export default function Home() {
 									onClick={resetToIdle}
 									className="inline-flex items-center justify-center rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800"
 								>
-									Translate another file
+									{activeMode === "translate"
+										? "Translate another file"
+										: "Process another file"}
 								</button>
 								<a
 									href="https://www.veed.io/subtitle-tools/edit?locale=en&source=/tools/subtitle-editor/srt-editor"
