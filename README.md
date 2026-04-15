@@ -39,6 +39,7 @@ Environment variables:
 - Optional model: `GEMINI_MODEL_NAME` (default: `gemini-3-flash-preview`)
 - Optional request batch size: `GEMINI_BATCH_TOKENS` (default: `350`, recommended range: `300-400` for Gemini 3)
 - Optional thinking level (Gemini 3): `GEMINI_THINKING_LEVEL` (`minimal`, `low`, `medium`, `high`; default: `low`)
+- Optional parallel translations: `TRANSLATION_MAX_PARALLEL` (default: `5`, range: `1-20`)
 
 Use the same variable names in Netlify site environment settings.
 

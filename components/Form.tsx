@@ -191,7 +191,7 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
 									</p>
 									<p className="text-sm text-slate-500">
 										{files.length
-											? "Queued files are translated one by one."
+											? "Queued files are translated in parallel."
 											: "Only .srt files are accepted."}
 									</p>
 								</div>

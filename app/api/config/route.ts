@@ -15,6 +15,7 @@ export async function GET() {
 			message,
 			modelName: config.modelName,
 			maxTokensPerRequest: config.maxTokensPerRequest,
+			maxParallel: config.maxParallel,
 			thinkingLevel: config.thinkingLevel,
 			isGemini3Model: config.isGemini3Model,
 		}),
