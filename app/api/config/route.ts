@@ -18,6 +18,9 @@ export async function GET() {
 			maxParallel: config.maxParallel,
 			thinkingLevel: config.thinkingLevel,
 			isGemini3Model: config.isGemini3Model,
+			prohibitedContentPolicy: config.prohibitedContentPolicy,
+			prohibitedContentPlaceholder: config.prohibitedContentPlaceholder,
+			maxSplitDepth: config.maxSplitDepth,
 		}),
 		{
 			headers: { "Content-Type": "application/json" },

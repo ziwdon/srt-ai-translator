@@ -22,6 +22,12 @@ const BASE_BACKOFF_DELAY_MS = 1000;
 const MAX_BACKOFF_DELAY_MS = 12000;
 const INTER_BATCH_DELAY_MS = 150;
 const RETRIABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const CONTENT_BLOCK_ERROR_CODES = new Set([
+	"PROHIBITED_CONTENT",
+	"SAFETY_FILTER",
+	"CONTENT_FILTER",
+	"PROMPT_BLOCKED",
+]);
 const DEFAULT_MAX_PARALLEL = 5;
 const MIN_MAX_PARALLEL = 1;
 const MAX_MAX_PARALLEL = 20;
@@ -36,8 +42,16 @@ type FileResult = {
 	translatedContent?: string;
 	outputFilename?: string;
 	error?: string;
+	retryable?: boolean;
+	blockedSegmentIds?: number[];
+	isPartialTranslation?: boolean;
 	totalBatches: number;
 	completedBatches: number;
+};
+
+type BatchRequestError = Error & {
+	code?: string;
+	nonRetryable?: boolean;
 };
 
 type BulkProgress = {
@@ -83,6 +97,28 @@ function isRetriableStatus(status: number): boolean {
 	return RETRIABLE_STATUS_CODES.has(status);
 }
 
+function isContentBlockErrorCode(code: unknown): boolean {
+	return typeof code === "string" && CONTENT_BLOCK_ERROR_CODES.has(code);
+}
+
+function createBatchRequestError(
+	message: string,
+	options?: { code?: string; nonRetryable?: boolean },
+): BatchRequestError {
+	const error = new Error(message) as BatchRequestError;
+	if (options?.code) {
+		error.code = options.code;
+	}
+	if (options?.nonRetryable) {
+		error.nonRetryable = true;
+	}
+	return error;
+}
+
+function isBatchRequestError(error: unknown): error is BatchRequestError {
+	return error instanceof Error;
+}
+
 function getRetryDelayMs(attempt: number): number {
 	const exponentialDelay = BASE_BACKOFF_DELAY_MS * 2 ** (attempt - 1);
 	const jitter = Math.floor(Math.random() * 250);
@@ -112,6 +148,10 @@ async function requestTranslationBatch(
 				},
 			});
 		} catch (error) {
+			if (isBatchRequestError(error) && error.nonRetryable) {
+				throw error;
+			}
+
 			lastError =
 				error instanceof Error
 					? error
@@ -134,10 +174,33 @@ async function requestTranslationBatch(
 		}
 
 		const errorText = await response.text().catch(() => "");
+		let errorBody: Record<string, unknown> | null = null;
+		if (errorText) {
+			try {
+				const parsed = JSON.parse(errorText) as unknown;
+				if (parsed && typeof parsed === "object") {
+					errorBody = parsed as Record<string, unknown>;
+				}
+			} catch {
+				errorBody = null;
+			}
+		}
+
+		const code = typeof errorBody?.code === "string" ? errorBody.code : undefined;
+		const serverMessage =
+			typeof errorBody?.error === "string" ? errorBody.error : undefined;
 		const errorMessage =
+			serverMessage ||
 			errorText ||
 			`Translation request batch ${requestNumber} failed with status ${response.status}.`;
-		lastError = new Error(errorMessage);
+		lastError = createBatchRequestError(errorMessage, {
+			code,
+			nonRetryable: isContentBlockErrorCode(code),
+		});
+
+		if (isContentBlockErrorCode(code)) {
+			throw lastError;
+		}
 
 		if (!isRetriableStatus(response.status) || attempt === MAX_BATCH_RETRIES) {
 			throw lastError;
@@ -264,6 +327,7 @@ function FileProgressRow({ result }: { result: FileResult }) {
 			? toPercent(result.completedBatches, result.totalBatches)
 			: 0;
 	const isTranslating = result.status === "translating";
+	const blockedCount = result.blockedSegmentIds?.length ?? 0;
 	const batchLabel =
 		result.totalBatches > 0
 			? `${Math.min(result.completedBatches, result.totalBatches)}/${result.totalBatches} batches`
@@ -273,6 +337,12 @@ function FileProgressRow({ result }: { result: FileResult }) {
 			<div className="min-w-0 flex-1">
 				<p className="truncate text-sm font-medium text-slate-700">{result.filename}</p>
 				<p className="mt-1 text-xs text-slate-500">{batchLabel}</p>
+				{result.status === "success" && blockedCount > 0 && (
+					<p className="mt-1 text-xs text-amber-700">
+						{blockedCount} segment{blockedCount === 1 ? "" : "s"} used fallback text
+						due to content restrictions.
+					</p>
+				)}
 			</div>
 			{isTranslating && (
 				<div className="w-36 shrink-0">
@@ -390,11 +460,24 @@ export default function Home() {
 	async function handleStream(response: Response): Promise<{
 		content: string;
 		translatedSegmentCount: number;
+		blockedSegmentIds: number[];
+		isPartial: boolean;
 	}> {
 		const data = response.body;
 		if (!data) {
 			throw new Error("Translation response body is missing.");
 		}
+
+		const blockedSegmentsHeader = response.headers.get(
+			"x-translation-blocked-segments",
+		);
+		const blockedSegmentIds = blockedSegmentsHeader
+			? blockedSegmentsHeader
+					.split(",")
+					.map((segmentId) => Number.parseInt(segmentId.trim(), 10))
+					.filter((segmentId) => Number.isFinite(segmentId))
+			: [];
+		const isPartial = response.headers.get("x-translation-status") === "partial";
 
 		let content = "";
 		let translatedSegmentCount = 0;
@@ -440,7 +523,7 @@ export default function Home() {
 			translatedSegmentCount += 1;
 		}
 
-		return { content, translatedSegmentCount };
+		return { content, translatedSegmentCount, blockedSegmentIds, isPartial };
 	}
 
 	function updateFileProgress(
@@ -466,6 +549,8 @@ export default function Home() {
 		translatedContent: string;
 		outputFilename: string;
 		totalBatches: number;
+		blockedSegmentIds: number[];
+		isPartialTranslation: boolean;
 	}> {
 		if (!content) {
 			throw new Error("No content provided.");
@@ -498,6 +583,8 @@ export default function Home() {
 
 		let translatedContent = "";
 		let translatedSegmentCount = 0;
+		const blockedSegmentIds = new Set<number>();
+		let isPartialTranslation = false;
 		const translationRunId = crypto.randomUUID();
 
 		for (let requestIndex = 0; requestIndex < requestGroups.length; requestIndex += 1) {
@@ -512,6 +599,12 @@ export default function Home() {
 			);
 
 			const batchResult = await handleStream(response);
+			if (batchResult.isPartial) {
+				isPartialTranslation = true;
+			}
+			for (const blockedSegmentId of batchResult.blockedSegmentIds) {
+				blockedSegmentIds.add(blockedSegmentId);
+			}
 
 			if (batchResult.translatedSegmentCount !== requestGroup.length) {
 				throw new Error(
@@ -567,7 +660,13 @@ export default function Home() {
 			throw new Error("Error occurred while reading the translated output.");
 		}
 
-		return { translatedContent, outputFilename, totalBatches: requestGroups.length };
+		return {
+			translatedContent,
+			outputFilename,
+			totalBatches: requestGroups.length,
+			blockedSegmentIds: Array.from(blockedSegmentIds),
+			isPartialTranslation,
+		};
 	}
 
 	async function finalizeBulkRun(results: FileResult[], language: string) {
@@ -636,6 +735,7 @@ export default function Home() {
 			hasIndexedItems && fileResults.length
 				? fileResults.map((result) => ({
 						...result,
+						retryable: result.retryable ?? true,
 						totalBatches: result.totalBatches ?? 0,
 						completedBatches: result.completedBatches ?? 0,
 				  }))
@@ -643,6 +743,9 @@ export default function Home() {
 						filename: item.filename,
 						content: item.content,
 						status: "pending" as const,
+						retryable: true,
+						blockedSegmentIds: [],
+						isPartialTranslation: false,
 						totalBatches: 0,
 						completedBatches: 0,
 				  }));
@@ -662,6 +765,9 @@ export default function Home() {
 					translatedContent: undefined,
 					outputFilename: undefined,
 					error: undefined,
+					retryable: true,
+					blockedSegmentIds: [],
+					isPartialTranslation: false,
 					totalBatches: 0,
 					completedBatches: 0,
 				};
@@ -700,6 +806,9 @@ export default function Home() {
 					translatedContent: undefined,
 					outputFilename: undefined,
 					error: undefined,
+					retryable: true,
+					blockedSegmentIds: [],
+					isPartialTranslation: false,
 					totalBatches: 0,
 					completedBatches: 0,
 				};
@@ -714,6 +823,9 @@ export default function Home() {
 						translatedContent: undefined,
 						outputFilename: undefined,
 						error: undefined,
+						retryable: true,
+						blockedSegmentIds: [],
+						isPartialTranslation: false,
 						totalBatches: 0,
 						completedBatches: 0,
 					};
@@ -721,7 +833,13 @@ export default function Home() {
 				});
 
 				try {
-					const { translatedContent, outputFilename, totalBatches } =
+					const {
+						translatedContent,
+						outputFilename,
+						totalBatches,
+						blockedSegmentIds,
+						isPartialTranslation,
+					} =
 						await translateSingleFile(
 						queueItem.content,
 						language,
@@ -734,6 +852,9 @@ export default function Home() {
 						translatedContent,
 						outputFilename,
 						error: undefined,
+						retryable: true,
+						blockedSegmentIds,
+						isPartialTranslation,
 						totalBatches,
 						completedBatches: totalBatches,
 					};
@@ -748,6 +869,9 @@ export default function Home() {
 							translatedContent,
 							outputFilename,
 							error: undefined,
+							retryable: true,
+							blockedSegmentIds,
+							isPartialTranslation,
 							totalBatches,
 							completedBatches: totalBatches,
 						};
@@ -757,10 +881,12 @@ export default function Home() {
 					console.error(`Translation failed for ${queueItem.filename}`, error);
 					const message =
 						error instanceof Error ? error.message : "Unknown translation error.";
+					const retryable = !(isBatchRequestError(error) && error.nonRetryable);
 					nextResults[targetIndex] = {
 						...nextResults[targetIndex],
 						status: "failed",
 						error: message,
+						retryable,
 					};
 					setFileResults((prev) => {
 						if (targetIndex < 0 || targetIndex >= prev.length) {
@@ -771,6 +897,7 @@ export default function Home() {
 							...next[targetIndex],
 							status: "failed",
 							error: message,
+							retryable,
 						};
 						return next;
 					});
@@ -818,7 +945,9 @@ export default function Home() {
 
 		const retryQueue = fileResults
 			.map((result, index) => ({ result, index }))
-			.filter(({ result }) => result.status === "failed")
+			.filter(
+				({ result }) => result.status === "failed" && result.retryable !== false,
+			)
 			.map(({ result, index }) => ({
 				filename: result.filename,
 				content: result.content,
@@ -879,6 +1008,16 @@ export default function Home() {
 	const isMultiFileRun = fileResults.length > 1;
 	const successCount = fileResults.filter((result) => result.status === "success").length;
 	const failureCount = fileResults.filter((result) => result.status === "failed").length;
+	const retryableFailureCount = fileResults.filter(
+		(result) => result.status === "failed" && result.retryable !== false,
+	).length;
+	const partialFileCount = fileResults.filter(
+		(result) => result.status === "success" && result.isPartialTranslation,
+	).length;
+	const blockedSegmentCount = fileResults.reduce(
+		(total, result) => total + (result.blockedSegmentIds?.length ?? 0),
+		0,
+	);
 
 	const titles: Record<AppMode, Record<TranslationStatus, string>> = {
 		translate: {
@@ -1103,6 +1242,16 @@ export default function Home() {
 									<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
 										Duration: {formatElapsedTime(elapsedSeconds)}
 									</span>
+									{blockedSegmentCount > 0 && (
+										<span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
+											Blocked segments: {blockedSegmentCount}
+										</span>
+									)}
+									{partialFileCount > 0 && (
+										<span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
+											Partial files: {partialFileCount}
+										</span>
+									)}
 								</div>
 
 								<div className="mt-5 overflow-x-auto rounded-2xl border border-slate-200">
@@ -1131,7 +1280,11 @@ export default function Home() {
 														</span>
 													</td>
 													<td className="px-4 py-3 text-slate-500">
-														{result.status === "failed" ? result.error || "-" : "-"}
+														{result.status === "failed"
+															? result.error || "-"
+															: result.isPartialTranslation
+																? `${result.blockedSegmentIds?.length ?? 0} segment(s) could not be translated due to content restrictions.`
+																: "-"}
 													</td>
 												</tr>
 											))}
@@ -1152,14 +1305,19 @@ export default function Home() {
 										Download ZIP again
 									</button>
 								)}
-								{failureCount > 0 && (
+								{retryableFailureCount > 0 && (
 									<button
 										type="button"
 										onClick={handleRetryFailed}
 										className="inline-flex items-center justify-center rounded-xl border border-rose-300 bg-rose-50 px-4 py-2.5 text-sm font-semibold text-rose-700 transition hover:bg-rose-100"
 									>
-										Retry failed ({failureCount})
+										Retry failed ({retryableFailureCount})
 									</button>
+								)}
+								{failureCount > 0 && retryableFailureCount === 0 && (
+									<p className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs font-semibold text-amber-700">
+										Failed files are not retryable without content changes.
+									</p>
 								)}
 								<button
 									type="button"
