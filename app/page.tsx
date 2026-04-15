@@ -263,8 +263,7 @@ function FileProgressRow({ result }: { result: FileResult }) {
 		result.totalBatches > 0
 			? toPercent(result.completedBatches, result.totalBatches)
 			: 0;
-	const isDone = result.status === "success";
-	const isFailed = result.status === "failed";
+	const isTranslating = result.status === "translating";
 	const batchLabel =
 		result.totalBatches > 0
 			? `${Math.min(result.completedBatches, result.totalBatches)}/${result.totalBatches} batches`
@@ -275,21 +274,16 @@ function FileProgressRow({ result }: { result: FileResult }) {
 				<p className="truncate text-sm font-medium text-slate-700">{result.filename}</p>
 				<p className="mt-1 text-xs text-slate-500">{batchLabel}</p>
 			</div>
-			<div className="w-36 shrink-0">
-				<div className="h-2 rounded-full bg-slate-200">
-					<div
-						className={classNames(
-							"h-full rounded-full transition-all duration-300",
-							isFailed
-								? "bg-rose-400"
-								: isDone
-									? "bg-emerald-500"
-									: "bg-gradient-to-r from-cyan-500 to-indigo-500",
-						)}
-						style={{ width: `${isDone ? 100 : percentage}%` }}
-					/>
+			{isTranslating && (
+				<div className="w-36 shrink-0">
+					<div className="h-2 rounded-full bg-slate-200">
+						<div
+							className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-indigo-500 transition-all duration-300"
+							style={{ width: `${percentage}%` }}
+						/>
+					</div>
 				</div>
-			</div>
+			)}
 			<span
 				title={result.status === "failed" ? result.error || "" : ""}
 				className={classNames(
