@@ -11,6 +11,7 @@
   "dependencies": {
     "@ai-sdk/google": "^3.0.30",
     "ai": "^6.0.92",
+    "jszip": "^3.10.1",
     "next": "^16.1.6",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
