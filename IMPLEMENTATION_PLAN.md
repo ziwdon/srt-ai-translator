@@ -89,7 +89,7 @@ User uploads files → Form.tsx reads files → handleBulkSubmit()
 ### Key Differences
 
 1. **Multiple `translateSingleFile` calls run concurrently** — each operates independently.
-2. **Per-file progress tracking** — each `FileResult` carries its own segment/request progress instead of a single global `progress` state.
+2. **Per-file progress tracking** — each `FileResult` carries its own batch-level progress (`completedBatches / totalBatches`) instead of a single global `progress` state.
 3. **No shared mutable live preview** — the `translatedChunks`/`originalChunks` state and the `Translating` component are removed.
 4. **Concurrency limit** — a semaphore/pool pattern controls how many files translate simultaneously.
 5. **Independent error isolation** — one file's failure does not affect other in-flight translations.
@@ -141,14 +141,14 @@ This is the largest and most complex set of changes. See Section 7 for detailed 
 **Summary of changes:**
 
 1. **New state: `maxParallel`** — fetched from `/api/config`, defaults to `5`.
-2. **Expanded `FileResult` type** — add per-file progress fields: `totalSegments`, `translatedSegments`, `totalRequests`, `completedRequests`.
+2. **Expanded `FileResult` type** — add per-file batch-level progress fields: `totalBatches`, `completedBatches`.
 3. **Remove state variables**: `translatedChunks`, `originalChunks`, `progress` (the global single-file `TranslationProgress`).
 4. **Remove components/sections**: `Translating` component, live preview section, SRT editor links (both bulk and single-file done views).
 5. **Refactor `translateSingleFile`** — instead of setting global `progress`/`translatedChunks` state, accept an `onProgress` callback and a file index. Update the corresponding `fileResults[index]` entry with per-file progress.
-6. **Refactor `handleStream`** — remove `setTranslatedChunks` calls. Keep the stream parsing logic intact for content accumulation and segment counting. Accept an `onTranslatedSegment` callback (unchanged interface) but no longer push to `translatedChunks`.
+6. **Simplify `handleStream`** — remove `setTranslatedChunks` calls and the `appendChunkToPreview` logic. The function still reads the response body stream, accumulates the full `content` string, and counts `translatedSegmentCount` (used to validate batch completeness). It no longer parses individual chunks into `Chunk` objects or pushes to any preview state. Accept an `onTranslatedSegment` callback for segment counting only.
 7. **Refactor `handleBulkSubmit`** — replace the sequential `for` loop with a concurrency-limited parallel executor (see Section 8).
-8. **Update busy UI** — replace the current stat tiles and progress bars (which show single-file segment/request progress) with a per-file progress list showing one progress bar per file.
-9. **Update done UI** — remove the "Open SRT editor" `<a>` link from both the bulk results section and the single-file done section.
+8. **Update busy UI** — replace the current stat tiles and progress bars (which show single-file segment/request progress) with a consistent per-file progress list showing one batch-level progress bar per file. Use the same layout for both single-file and multi-file translations (remove the `showBulkProgress` conditional).
+9. **Update done UI** — remove the "Open SRT editor" `<a>` link from both the bulk results section and the single-file done section. Unify the done view: use the same results layout (table with filename/status/error, action buttons) for both single-file and multi-file translations, removing the `showBulkProgress` branching in the done state. For a single file, the table has one row — this is simple and consistent.
 10. **Keep**: elapsed timer, file queue status list (enhanced with per-file progress bars), ZIP download, retry failed, reset to idle.
 
 ### 5.4 `components/Form.tsx`
@@ -312,27 +312,28 @@ type FileResult = {
     translatedContent?: string;
     outputFilename?: string;
     error?: string;
-    // Per-file progress (populated during translation)
-    totalSegments: number;
-    translatedSegments: number;
-    totalRequests: number;
-    completedRequests: number;
+    // Per-file batch-level progress (populated during translation)
+    totalBatches: number;
+    completedBatches: number;
 };
 ```
 
-Initialize new fields to `0` when creating entries.
+Initialize `totalBatches` and `completedBatches` to `0` when creating entries.
+
+**Why batch-level, not segment-level:** With multiple files translating in parallel, segment-level updates (`translatedSegments` incremented on every streamed segment across all files) would cause a high volume of concurrent React state updates. Batch-level progress is coarser but sufficient — each file typically has a handful of batches, so the progress bar moves in visible increments. This keeps state update frequency manageable and the UI responsive.
 
 **Remove the global `TranslationProgress` state entirely:**
 - Delete the `progress` state variable and its `EMPTY_PROGRESS` constant.
 - Delete the `TranslationProgress` type.
-- Delete `setProgress` calls throughout.
+- Delete all `setProgress` calls throughout `translateSingleFile`.
+- Delete the derived values `segmentProgress` and `requestProgress` (lines ~835–842).
 
 **Refactor `translateSingleFile`:**
 
 The function currently sets global state (`setProgress`, `setTranslatedChunks`, `setOriginalChunks`, `setActiveFilename`, `setActiveLanguage`). Refactor it to:
 
 1. Accept an additional parameter: `fileIndex: number` (the index in `fileResults`).
-2. Instead of calling `setProgress(...)`, call a helper that updates `fileResults[fileIndex]` with progress fields.
+2. Instead of calling `setProgress(...)`, call a helper that updates `fileResults[fileIndex]` with batch-level progress.
 3. Remove all `setTranslatedChunks`, `setOriginalChunks` calls.
 4. Remove `setActiveFilename` / `setActiveLanguage` calls from inside the function (set `activeLanguage` once in `handleBulkSubmit` before the parallel loop, as it's the same for all files).
 5. Keep `setActiveFilename` removed — with parallel files, there's no single "active" file name. The UI will show progress per file in the file list.
@@ -341,7 +342,7 @@ The function currently sets global state (`setProgress`, `setTranslatedChunks`, 
 ```typescript
 function updateFileProgress(
     fileIndex: number,
-    updates: Partial<Pick<FileResult, "totalSegments" | "translatedSegments" | "totalRequests" | "completedRequests">>,
+    updates: Partial<Pick<FileResult, "totalBatches" | "completedBatches">>,
 ) {
     setFileResults((prev) => {
         const next = [...prev];
@@ -351,10 +352,11 @@ function updateFileProgress(
 }
 ```
 
-Call this from within `translateSingleFile` at the same points where `setProgress` was previously called:
-- After parsing segments: `updateFileProgress(fileIndex, { totalSegments: originalSegments.length, totalRequests: requestGroups.length })`.
-- In `handleStream`'s `onTranslatedSegment`: increment `translatedSegments`.
-- After each batch completes: increment `completedRequests`.
+Call this from within `translateSingleFile` at two points:
+- **After computing `requestGroups`**: `updateFileProgress(fileIndex, { totalBatches: requestGroups.length })`.
+- **After each batch completes** (after `handleStream` + validation): `updateFileProgress(fileIndex, { completedBatches: requestIndex + 1 })`.
+
+The `handleStream` function's `onTranslatedSegment` callback is no longer needed for UI progress updates. It is still used internally for the segment count validation (`translatedSegmentCount`) that verifies each batch returned the expected number of segments — this validation logic is unchanged.
 
 ### 7.3 UI Simplification — Remove Real-Time Translation Preview
 
@@ -396,6 +398,17 @@ import type { Segment } from "@/types";
 
 **Delete `components/Timestamp.tsx`** entirely if it has no remaining imports anywhere in the codebase.
 
+**Simplify `handleStream`:**
+
+The current `handleStream` function (lines 375–452) does two things: (a) accumulates the full response content string, and (b) parses individual SRT blocks into `Chunk` objects and pushes them to `translatedChunks` for the live preview. With the preview removed, simplify it:
+
+- Remove the `appendChunkToPreview` inner function entirely.
+- Remove all `setTranslatedChunks` calls.
+- Keep the stream reading loop (`while (true) { reader.read()... }`) that accumulates `content`.
+- Keep the `translatedSegmentCount` logic (counting blank-line-separated blocks) — this is needed for the batch validation check in `translateSingleFile` (`batchResult.translatedSegmentCount !== requestGroup.length`).
+- The `onTranslatedSegment` callback parameter can be removed if it was only used to increment the global `progress.translatedSegments` — since that state no longer exists. The segment counting is now internal to `handleStream` only for validation purposes.
+- The function signature simplifies to: `async function handleStream(response: Response): Promise<{ content: string; translatedSegmentCount: number }>`.
+
 ### 7.4 UI Simplification — Remove SRT Editor Links
 
 **Location 1 — Bulk done view** (lines 1273–1280 in `page.tsx`):
@@ -436,11 +449,11 @@ Similarly for the offset mode text (line ~1301): *"Use the action buttons to pro
 │  ┌──────────────────────────────────────────────────┐│
 │  │ [Per-File Progress List]                         ││
 │  │                                                  ││
-│  │  file1.srt  [████████████░░░░] 75%  Translating  ││
-│  │  file2.srt  [████████░░░░░░░░] 50%  Translating  ││
-│  │  file3.srt  [████████████████] 100% ✓ Success    ││
-│  │  file4.srt  [░░░░░░░░░░░░░░░░] 0%   Pending     ││
-│  │  file5.srt  [                ] —    Failed ✗     ││
+│  │  file1.srt  [████████████░░░░] 3/4 batches  Translating  ││
+│  │  file2.srt  [████████░░░░░░░░] 2/4 batches  Translating  ││
+│  │  file3.srt  [████████████████] 100%          ✓ Success    ││
+│  │  file4.srt  [░░░░░░░░░░░░░░░░] —             Pending     ││
+│  │  file5.srt  [                ] —             Failed ✗     ││
 │  │  ...                                             ││
 │  └──────────────────────────────────────────────────┘│
 └──────────────────────────────────────────────────────┘
@@ -457,13 +470,13 @@ Similarly for the offset mode text (line ~1301): *"Use the action buttons to pro
 - Map `fileResults` to a scrollable list.
 - For each file, show:
   - **Filename** (truncated).
-  - **Progress bar** based on `translatedSegments / totalSegments` for that file. If `totalSegments === 0` and status is `"pending"`, show an empty/grey bar. If status is `"translating"` and `totalSegments > 0`, show the gradient bar with percentage.
+  - **Progress bar** based on `completedBatches / totalBatches` for that file. If `totalBatches === 0` and status is `"pending"`, show an empty/grey bar. If status is `"translating"` and `totalBatches > 0`, show the gradient bar with percentage. If status is `"success"`, show a full green bar.
   - **Status badge** — reuse `getFileStatusLabel`/`getFileStatusClasses`.
 - The list should be `max-h-[28rem] overflow-y-auto` (scrollable for many files).
 
-**3. For single-file translation (queue.length === 1):**
-- Show the same per-file progress list (with one entry), which naturally displays the progress bar for that single file. This keeps the UI consistent regardless of file count.
-- Alternatively, you can keep the simpler stat-tile view for single files; but for consistency and code simplicity, using the same per-file list for both cases is recommended.
+**3. Consistent UI for single-file and multi-file translations:**
+- Always show the same layout regardless of whether 1 file or 20 files are queued. When only 1 file is uploaded, the overall progress bar shows `0/1 → 1/1`, and the per-file list has one entry. This keeps the code simple (no branching on file count) and gives the user a consistent experience.
+- Remove the existing `showBulkProgress` conditional (`bulkProgress.totalFiles > 1`). The progress UI is always the same.
 
 #### Implementation in JSX
 
@@ -471,10 +484,9 @@ Create a new helper component (inline in `page.tsx`, like `ProgressRow`):
 
 ```typescript
 function FileProgressRow({ result }: { result: FileResult }) {
-    const percentage = result.totalSegments > 0
-        ? toPercent(result.translatedSegments, result.totalSegments)
+    const percentage = result.totalBatches > 0
+        ? toPercent(result.completedBatches, result.totalBatches)
         : 0;
-    const isActive = result.status === "translating";
     const isDone = result.status === "success";
     const isFailed = result.status === "failed";
 
@@ -595,7 +607,7 @@ For this codebase (all logic in `page.tsx`), defining it as a top-level utility 
 | Memory pressure from many large files in memory simultaneously | Low | Medium | Files are already loaded into memory upfront; parallel doesn't change peak memory |
 | Browser network connection limit (~6 concurrent per domain) | Low | Low | Each `translateSingleFile` issues sequential batch requests; typically only `maxParallel` concurrent HTTP requests at any moment |
 | `nextResults` shared mutable array causing stale reads | High (if not addressed) | High | **Must** switch to functional updater pattern for `setFileResults` instead of shared array (see Section 7.6 point 4) |
-| UI becoming unresponsive with many rapid state updates | Low | Low | React batches state updates in event handlers and async boundaries; per-file updates are infrequent (once per batch, not per segment if desired) |
+| UI becoming unresponsive with many rapid state updates | Low | Low | Batch-level progress (not segment-level) keeps update frequency low; React batches state updates in async boundaries |
 
 ---
 
@@ -611,9 +623,9 @@ After implementation, the AI model should verify each of the following items by 
 - [ ] **4.** `handleBulkSubmit` uses a concurrency-limited parallel pattern (not a sequential `for` loop) to process files.
 - [ ] **5.** The concurrency limit used in `handleBulkSubmit` matches the `maxParallel` state value from config.
 - [ ] **6.** Each `translateSingleFile` call is independently wrapped in `try/catch` so one file's failure doesn't abort others.
-- [ ] **7.** `FileResult` type includes `totalSegments`, `translatedSegments`, `totalRequests`, `completedRequests` fields (all initialized to `0`).
-- [ ] **8.** `translateSingleFile` updates per-file progress via the functional updater form of `setFileResults`, targeting the correct `fileIndex`.
-- [ ] **9.** No global `progress` (`TranslationProgress`) state remains — all progress is per-file within `fileResults`.
+- [ ] **7.** `FileResult` type includes `totalBatches` and `completedBatches` fields (both initialized to `0`).
+- [ ] **8.** `translateSingleFile` updates per-file batch progress via the functional updater form of `setFileResults`, targeting the correct `fileIndex`.
+- [ ] **9.** No global `progress` (`TranslationProgress`) state remains — all progress is per-file within `fileResults`. The derived values `segmentProgress` and `requestProgress` are also removed.
 - [ ] **10.** `bulkProgress.completedFiles` is correctly incremented as each file finishes (success or failure).
 
 ### UI Changes
@@ -622,55 +634,56 @@ After implementation, the AI model should verify each of the following items by 
 - [ ] **12.** The `translatedChunks` and `originalChunks` state variables are removed.
 - [ ] **13.** The `Timestamp` component import is removed from `page.tsx`. If `Timestamp.tsx` is no longer imported anywhere, the file is deleted.
 - [ ] **14.** Both "Open SRT editor" links (`<a href="https://www.veed.io/...">`) are removed — one from the bulk done view and one from the single-file/offset done view.
-- [ ] **15.** The busy-state UI shows a per-file progress list with a progress bar per file based on `translatedSegments / totalSegments`.
+- [ ] **15.** The busy-state UI shows a per-file progress list with a progress bar per file based on `completedBatches / totalBatches`.
 - [ ] **16.** The busy-state UI shows an overall file progress bar (`completedFiles / totalFiles`).
-- [ ] **17.** The elapsed timer still functions correctly during the busy state.
-- [ ] **18.** The "Auto-download will start when complete" pill is still shown during the busy state.
+- [ ] **17.** The same consistent busy-state UI is shown regardless of whether 1 file or N files are being translated (no `showBulkProgress` conditional branching).
+- [ ] **18.** The elapsed timer still functions correctly during the busy state.
+- [ ] **19.** The "Auto-download will start when complete" pill is still shown during the busy state.
 
 ### Downloads & Results
 
-- [ ] **19.** Single-file translation still triggers a direct `.srt` file download upon completion.
-- [ ] **20.** Multi-file translation still creates a ZIP archive and triggers download, with `zipDownload` state for re-download.
-- [ ] **21.** The "Download ZIP again" button still works in the done state.
-- [ ] **22.** The bulk results table (filename, status, error) is still shown in the done state.
+- [ ] **20.** Single-file translation still triggers a direct `.srt` file download upon completion.
+- [ ] **21.** Multi-file translation still creates a ZIP archive and triggers download, with `zipDownload` state for re-download.
+- [ ] **22.** The "Download ZIP again" button still works in the done state.
+- [ ] **23.** The bulk results table (filename, status, error) is still shown in the done state.
 
 ### Retry & Reset
 
-- [ ] **23.** The "Retry failed" button still works: it builds a queue of failed files and passes them to `handleBulkSubmit` with `resultIndex` set.
-- [ ] **24.** Retried files are processed in parallel (using the same concurrency limit).
-- [ ] **25.** Succeeded files are preserved during retry — their entries in `fileResults` are not overwritten.
-- [ ] **26.** `resetToIdle` properly clears all state and returns to the idle form view.
+- [ ] **24.** The "Retry failed" button still works: it builds a queue of failed files and passes them to `handleBulkSubmit` with `resultIndex` set.
+- [ ] **25.** Retried files are processed in parallel (using the same concurrency limit).
+- [ ] **26.** Succeeded files are preserved during retry — their entries in `fileResults` are not overwritten.
+- [ ] **27.** `resetToIdle` properly clears all state and returns to the idle form view.
 
 ### Error Handling & Resilience
 
-- [ ] **27.** All `setFileResults` calls inside `translateSingleFile` and the worker function use the **functional updater** form `setFileResults(prev => ...)` — never setting state with a captured mutable array.
-- [ ] **28.** `requestTranslationBatch` retry logic (5 retries, exponential backoff, jitter, retriable status codes) is unchanged and functional.
-- [ ] **29.** Server-side `retrieveTranslation` retry logic (3 retries, 55s timeout) is unchanged.
-- [ ] **30.** A file failing mid-translation does not prevent other in-flight or pending files from completing.
-- [ ] **31.** If **all** files fail, the app shows an alert and resets to idle (existing behavior preserved).
+- [ ] **28.** All `setFileResults` calls inside `translateSingleFile` and the worker function use the **functional updater** form `setFileResults(prev => ...)` — never setting state with a captured mutable array.
+- [ ] **29.** `requestTranslationBatch` retry logic (5 retries, exponential backoff, jitter, retriable status codes) is unchanged and functional.
+- [ ] **30.** Server-side `retrieveTranslation` retry logic (3 retries, 55s timeout) is unchanged.
+- [ ] **31.** A file failing mid-translation does not prevent other in-flight or pending files from completing.
+- [ ] **32.** If **all** files fail, the app shows an alert and resets to idle (existing behavior preserved).
 
 ### Configuration & Environment
 
-- [ ] **32.** `.env.example` includes `TRANSLATION_MAX_PARALLEL=5`.
-- [ ] **33.** `README.md` documents the `TRANSLATION_MAX_PARALLEL` variable.
-- [ ] **34.** The `app/api/route.ts` file is **unchanged** — verify no modifications were made to the server-side translation endpoint.
-- [ ] **35.** The `lib/srt.ts`, `lib/client.ts`, `lib/zip.ts` files are **unchanged**.
+- [ ] **33.** `.env.example` includes `TRANSLATION_MAX_PARALLEL=5`.
+- [ ] **34.** `README.md` documents the `TRANSLATION_MAX_PARALLEL` variable.
+- [ ] **35.** The `app/api/route.ts` file is **unchanged** — verify no modifications were made to the server-side translation endpoint.
+- [ ] **36.** The `lib/srt.ts`, `lib/client.ts`, `lib/zip.ts` files are **unchanged**.
 
 ### Preserved Features (No Regressions)
 
-- [ ] **36.** Single-file translation works (upload 1 file → translate → download `.srt`).
-- [ ] **37.** Time-offset mode (`activeMode === "offset"`) is fully functional and unmodified.
-- [ ] **38.** Language selection (predefined + custom) works as before.
-- [ ] **39.** File upload drag-and-drop, file validation (`.srt` only), duplicate detection, clear/remove all work as before.
-- [ ] **40.** The configuration error screen still shows when `GOOGLE_GENERATIVE_AI_API_KEY` is missing.
-- [ ] **41.** The "Translate" / "Time Offset" mode toggle in the idle state still works.
-- [ ] **42.** The `Chunk` type in `types.ts` is unchanged (or, if the import is removed from `page.tsx`, verify it's still exported for any other consumer — currently `Timestamp.tsx` uses it, so if that file is deleted, `Chunk` may be orphaned but harmless).
-- [ ] **43.** The output filename logic (`.eng`, `.spa`, `.pop` suffixes) in `translateSingleFile` is unchanged.
+- [ ] **37.** Single-file translation works (upload 1 file → translate → download `.srt`).
+- [ ] **38.** Time-offset mode (`activeMode === "offset"`) is fully functional and **completely unmodified** — no code in `handleOffset`, `OffsetForm.tsx`, or the offset-related done view has been touched.
+- [ ] **39.** Language selection (predefined + custom) works as before.
+- [ ] **40.** File upload drag-and-drop, file validation (`.srt` only), duplicate detection, clear/remove all work as before.
+- [ ] **41.** The configuration error screen still shows when `GOOGLE_GENERATIVE_AI_API_KEY` is missing.
+- [ ] **42.** The "Translate" / "Time Offset" mode toggle in the idle state still works.
+- [ ] **43.** The `Chunk` type in `types.ts` is unchanged (or, if the import is removed from `page.tsx`, verify it's still exported for any other consumer — currently `Timestamp.tsx` uses it, so if that file is deleted, `Chunk` may be orphaned but harmless).
+- [ ] **44.** The output filename logic (`.eng`, `.spa`, `.pop` suffixes) in `translateSingleFile` is unchanged.
 
 ### Code Quality
 
-- [ ] **44.** No unused imports remain in any modified file.
-- [ ] **45.** No unused state variables, functions, or type definitions remain.
-- [ ] **46.** TypeScript types are consistent — `FileResult` uses the new shape everywhere it's created or referenced.
-- [ ] **47.** The `Form.tsx` help text reflects parallel processing (not "one by one").
-- [ ] **48.** No `console.log` debugging statements were accidentally left in (existing `console.info`, `console.warn`, `console.error` for structured logging are fine).
+- [ ] **45.** No unused imports remain in any modified file.
+- [ ] **46.** No unused state variables, functions, or type definitions remain.
+- [ ] **47.** TypeScript types are consistent — `FileResult` uses the new shape everywhere it's created or referenced.
+- [ ] **48.** The `Form.tsx` help text reflects parallel processing (not "one by one").
+- [ ] **49.** No `console.log` debugging statements were accidentally left in (existing `console.info`, `console.warn`, `console.error` for structured logging are fine).
