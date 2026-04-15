@@ -5,9 +5,8 @@ import Image from "next/image";
 
 interface Props {
 	onSubmit: (
-		content: string,
+		queue: { filename: string; content: string }[],
 		language: string,
-		filename: string,
 	) => void | Promise<void>;
 }
 
@@ -47,7 +46,7 @@ const formatFileSize = (sizeInBytes: number) => {
 };
 
 const SrtForm: React.FC<Props> = ({ onSubmit }) => {
-	const [file, setFile] = useState<File>();
+	const [files, setFiles] = useState<File[]>([]);
 	const [selectedOption, setSelectedOption] = useState<string>("");
 	const [customLanguage, setCustomLanguage] = useState<string>("");
 	const [dragging, setDragging] = useState<boolean>(false);
@@ -62,30 +61,76 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
 		[selectedOption, customLanguage],
 	);
 
-	const canSubmit = Boolean(file && language && !isSubmitting);
+	const canSubmit = Boolean(files.length && language && !isSubmitting);
 
-	const setSelectedFile = (incomingFile?: File) => {
-		if (!incomingFile) return;
-		if (!isSrtFile(incomingFile)) {
-			setFile(undefined);
-			setFileError("Please upload a valid .srt subtitle file.");
+	const appendFiles = (incomingFiles: File[]) => {
+		if (!incomingFiles.length) {
+			return;
+		}
+
+		const invalidFiles: string[] = [];
+		const validFiles: File[] = [];
+		for (const incomingFile of incomingFiles) {
+			if (!isSrtFile(incomingFile)) {
+				invalidFiles.push(incomingFile.name);
+				continue;
+			}
+			validFiles.push(incomingFile);
+		}
+
+		setFiles((prev) => {
+			const seen = new Set(prev.map((existingFile) => `${existingFile.name}:${existingFile.size}`));
+			const next = [...prev];
+
+			for (const incomingFile of validFiles) {
+				const key = `${incomingFile.name}:${incomingFile.size}`;
+				if (seen.has(key)) {
+					continue;
+				}
+
+				seen.add(key);
+				next.push(incomingFile);
+			}
+
+			return next;
+		});
+
+		if (invalidFiles.length) {
+			setFileError(
+				invalidFiles.length === 1
+					? `Ignored "${invalidFiles[0]}". Please upload valid .srt files only.`
+					: `Ignored ${invalidFiles.length} invalid files. Please upload valid .srt files only.`,
+			);
 			return;
 		}
 
 		setFileError(null);
-		setFile(incomingFile);
+	};
+
+	const removeFile = (targetFileIndex: number) => {
+		setFiles((prev) => prev.filter((_, index) => index !== targetFileIndex));
+	};
+
+	const clearAllFiles = () => {
+		setFiles([]);
+		setFileError(null);
 	};
 
 	const handleSubmit = async (event: FormEvent) => {
 		event.preventDefault();
-		if (!file || !language || isSubmitting) {
+		if (!files.length || !language || isSubmitting) {
 			return;
 		}
 
 		try {
 			setIsSubmitting(true);
-			const content = await readFileContents(file);
-			onSubmit(content, language, file.name);
+			const queue = await Promise.all(
+				files.map(async (file) => ({
+					filename: file.name,
+					content: await readFileContents(file),
+				})),
+			);
+			await onSubmit(queue, language);
 		} finally {
 			setIsSubmitting(false);
 		}
@@ -96,7 +141,7 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
 		setDragging(false);
 
 		if (!event.dataTransfer.files?.length) return;
-		setSelectedFile(event.dataTransfer.files[0]);
+		appendFiles(Array.from(event.dataTransfer.files));
 	};
 
 	return (
@@ -131,36 +176,88 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
 								<input
 									type="file"
 									accept=".srt"
-									onChange={(event) => setSelectedFile(event.target.files?.[0])}
+									multiple
+									onChange={(event) => {
+										appendFiles(Array.from(event.target.files ?? []));
+										event.currentTarget.value = "";
+									}}
 									className="absolute inset-0 cursor-pointer opacity-0"
 								/>
 								<div className="space-y-1">
 									<p className="text-sm font-semibold text-slate-800">
-										{file
-											? "File selected and ready for translation"
-											: "Drag and drop your subtitle file here"}
+										{files.length
+											? `${files.length} file${files.length > 1 ? "s" : ""} ready - drop more to add`
+											: "Drag and drop subtitle files here"}
 									</p>
 									<p className="text-sm text-slate-500">
-										{file
-											? `${file.name} • ${formatFileSize(file.size)}`
+										{files.length
+											? "Queued files are translated one by one."
 											: "Only .srt files are accepted."}
 									</p>
 								</div>
 								<div className="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-indigo-600 shadow-sm">
-									{file ? "Replace file" : "Browse file"}
+									{files.length ? "Add files" : "Browse files"}
 								</div>
 							</div>
 							{fileError && (
 								<p className="mt-2 text-sm font-medium text-rose-600">{fileError}</p>
 							)}
+							{files.length > 0 && (
+								<div className="mt-4 rounded-2xl border border-slate-200 bg-white">
+									<div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+										<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+											Queued files
+										</p>
+										<button
+											type="button"
+											onClick={clearAllFiles}
+											className="text-xs font-semibold text-slate-500 transition hover:text-slate-700"
+										>
+											Clear all
+										</button>
+									</div>
+									<ul className="max-h-44 divide-y divide-slate-100 overflow-y-auto">
+										{files.map((queuedFile, index) => (
+											<li
+												key={`${queuedFile.name}:${queuedFile.size}:${index}`}
+												className="flex items-center justify-between gap-3 px-4 py-2.5"
+											>
+												<div className="min-w-0">
+													<p className="truncate text-sm font-medium text-slate-800">
+														{queuedFile.name}
+													</p>
+													<p className="text-xs text-slate-500">
+														{formatFileSize(queuedFile.size)}
+													</p>
+												</div>
+												<button
+													type="button"
+													onClick={() => removeFile(index)}
+													className="rounded-md px-2 py-1 text-sm font-semibold text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+													aria-label={`Remove ${queuedFile.name}`}
+												>
+													&times;
+												</button>
+											</li>
+										))}
+									</ul>
+								</div>
+							)}
 						</section>
 
-						<section className={classNames("transition", file ? "opacity-100" : "opacity-65")}>
+						<section
+							className={classNames(
+								"transition",
+								files.length ? "opacity-100" : "opacity-65",
+							)}
+						>
 							<div className="mb-3 flex items-center gap-2 text-sm font-semibold text-slate-600">
 								<span
 									className={classNames(
 										"inline-flex h-6 w-6 items-center justify-center rounded-full text-xs",
-										file ? "bg-slate-900 text-white" : "bg-slate-200 text-slate-500",
+										files.length
+											? "bg-slate-900 text-white"
+											: "bg-slate-200 text-slate-500",
 									)}
 								>
 									2
@@ -206,7 +303,9 @@ const SrtForm: React.FC<Props> = ({ onSubmit }) => {
 						>
 							{isSubmitting
 								? "Preparing translation..."
-								: `Translate${language ? ` to ${language}` : ""}`}
+								: files.length > 1
+									? `Translate ${files.length} files${language ? ` to ${language}` : ""}`
+									: `Translate${language ? ` to ${language}` : ""}`}
 						</button>
 					</div>
 
