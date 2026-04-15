@@ -1,6 +1,22 @@
-import { groupSegmentsByTokenLength } from "@/lib/srt";
 import { parseSegment } from "@/lib/client";
+import {
+	applyIrreducibleBlockPolicy,
+	attachTranslationErrorInfo,
+	classifyFinishReason,
+	classifyTranslationError,
+	getTranslationErrorInfo,
+	translationErrorCategoryToCode,
+} from "@/lib/content-block-handler";
+import { groupSegmentsByTokenLength } from "@/lib/srt";
 import { resolveTranslationRuntimeConfig } from "@/lib/translation-config";
+import type {
+	ProhibitedContentPolicy,
+	Segment,
+	TranslatedSegmentResult,
+	TranslationErrorCategory,
+	TranslationErrorInfo,
+	TranslationGroupResult,
+} from "@/types";
 import { google } from "@ai-sdk/google";
 import { generateText } from "ai";
 
@@ -11,6 +27,28 @@ export const maxDuration = 300;
 const MAX_RETRIES = 3;
 const MODEL_CALL_TIMEOUT_MS = 55_000;
 const SEGMENT_BLOCK_SPLIT_REGEX = /\r?\n\s*\r?\n/;
+const BASE_SERVER_BACKOFF_DELAY_MS = 1_000;
+const MAX_SERVER_BACKOFF_DELAY_MS = 8_000;
+
+type TranslationRequestContext = {
+	runId: string;
+	batchLabel: string;
+	groupIndex: number;
+	totalGroups: number;
+	modelName: string;
+	thinkingLevel: "minimal" | "low" | "medium" | "high";
+	isGemini3Model: boolean;
+};
+
+type TranslationFallbackConfig = {
+	policy: ProhibitedContentPolicy;
+	placeholder: string;
+	maxSplitDepth: number;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object";
+}
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -129,27 +167,109 @@ function toErrorLog(error: unknown): Record<string, unknown> {
 	return details;
 }
 
-type TranslationRequestContext = {
-	runId: string;
-	batchLabel: string;
-	groupIndex: number;
-	totalGroups: number;
-	translationDelimiter: string;
-	modelName: string;
-	thinkingLevel: "minimal" | "low" | "medium" | "high";
-	isGemini3Model: boolean;
-};
+function getServerRetryDelayMs(attempt: number): number {
+	const exponentialDelay = BASE_SERVER_BACKOFF_DELAY_MS * 2 ** (attempt - 1);
+	const jitter = Math.floor(Math.random() * 250);
+	return Math.min(MAX_SERVER_BACKOFF_DELAY_MS, exponentialDelay + jitter);
+}
+
+function getMaxAttemptsForCategory(category: TranslationErrorCategory): number {
+	if (category === "segment_mismatch" || category === "unknown") {
+		return 2;
+	}
+	return MAX_RETRIES;
+}
+
+function extractProviderResponseIdFromResult(response: unknown): string | undefined {
+	if (!isRecord(response)) {
+		return undefined;
+	}
+
+	const directId = response.id;
+	if (typeof directId === "string") {
+		return directId;
+	}
+
+	const responseMetadata = response.response;
+	if (!isRecord(responseMetadata)) {
+		return undefined;
+	}
+
+	return typeof responseMetadata.id === "string" ? responseMetadata.id : undefined;
+}
+
+function buildErrorMessage(info: TranslationErrorInfo): string {
+	switch (info.category) {
+		case "prohibited_content":
+		case "safety_filter":
+		case "content_filter":
+		case "prompt_blocked":
+			return "Translation blocked due to content restrictions.";
+		case "timeout":
+			return "Translation request timed out. Please retry.";
+		case "segment_mismatch":
+			return "Translation output was invalid. Please retry.";
+		case "transient":
+		case "network":
+			return "Translation provider is temporarily unavailable. Please retry.";
+		case "unknown":
+		default:
+			return "Error during translation";
+	}
+}
+
+function toJsonResponse(
+	body: Record<string, unknown>,
+	status: number,
+	runId: string,
+): Response {
+	return new Response(JSON.stringify(body), {
+		status,
+		headers: {
+			"Content-Type": "application/json",
+			"x-translation-run-id": runId,
+		},
+	});
+}
+
+function mergeGroupResults(
+	leftResult: TranslationGroupResult,
+	rightResult: TranslationGroupResult,
+	depth: number,
+): TranslationGroupResult {
+	const blockedSegmentIds = Array.from(
+		new Set([...leftResult.blockedSegmentIds, ...rightResult.blockedSegmentIds]),
+	);
+	const blockedReasons = Array.from(
+		new Set([...leftResult.blockedReasons, ...rightResult.blockedReasons]),
+	);
+
+	return {
+		segments: [...leftResult.segments, ...rightResult.segments],
+		hasBlockedSegments: blockedSegmentIds.length > 0,
+		blockedSegmentIds,
+		blockedReasons,
+		splitDepth: Math.max(depth, leftResult.splitDepth, rightResult.splitDepth),
+	};
+}
 
 const retrieveTranslation = async (
-	text: string,
+	segments: Segment[],
 	language: string,
-	expectedSegments: number,
 	context: TranslationRequestContext,
+	depth: number,
 ): Promise<string[]> => {
+	const expectedSegments = segments.length;
+	const segmentIds = segments.map((segment) => segment.id);
+
 	for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
 		const attemptStartedAt = Date.now();
 		const abortController = new AbortController();
 		const timeoutId = setTimeout(() => abortController.abort(), MODEL_CALL_TIMEOUT_MS);
+		const translationDelimiter = `|||SRT_SEGMENT_${crypto
+			.randomUUID()
+			.replace(/-/g, "")}|||`;
+		const text = segments.map((segment) => segment.text).join(translationDelimiter);
 
 		console.info(
 			`[translate][${context.runId}] Batch ${context.batchLabel} group ${context.groupIndex}/${context.totalGroups} attempt ${attempt}/${MAX_RETRIES} started`,
@@ -159,11 +279,13 @@ const retrieveTranslation = async (
 				model: context.modelName,
 				thinkingLevel: context.thinkingLevel,
 				isGemini3Model: context.isGemini3Model,
+				splitDepth: depth,
+				segmentIds,
 			},
 		);
 
 		try {
-			const { text: translatedText } = await generateText({
+			const result = await generateText({
 				model: google(context.modelName),
 				...(context.isGemini3Model
 					? {
@@ -199,11 +321,11 @@ const retrieveTranslation = async (
 							- If a segment has multiple lines (for example, dialogue turns), keep the same line order and line-break structure.
 							- Preserve punctuation style and emphasis (including dashes for dialogue turns).
 
-							The input text contains ${expectedSegments} subtitle segments separated by "${context.translationDelimiter}".
-							Return exactly ${expectedSegments} translated segments in the same order, separated only by "${context.translationDelimiter}".
+							The input text contains ${expectedSegments} subtitle segments separated by "${translationDelimiter}".
+							Return exactly ${expectedSegments} translated segments in the same order, separated only by "${translationDelimiter}".
 							Output only translated segment text.
 							Never add numbering, timestamps, markdown, code fences, or explanations.
-							Never include "${context.translationDelimiter}" inside any translated segment.`,
+							Never include "${translationDelimiter}" inside any translated segment.`,
 					},
 					{
 						role: "user",
@@ -212,8 +334,36 @@ const retrieveTranslation = async (
 				],
 			});
 
+			const providerResponseId = extractProviderResponseIdFromResult(
+				(result as { response?: unknown }).response,
+			);
+			const finishReasonInfo = classifyFinishReason(
+				typeof result.finishReason === "string" ? result.finishReason : undefined,
+				providerResponseId,
+			);
+			if (finishReasonInfo) {
+				console.warn(
+					`[translate][${context.runId}] Batch ${context.batchLabel} group ${context.groupIndex}/${context.totalGroups} finishReason non-normal`,
+					{
+						splitDepth: depth,
+						finishReason: finishReasonInfo.blockReason,
+						segmentCount: expectedSegments,
+						segmentIds,
+						providerResponseId: finishReasonInfo.providerResponseId,
+					},
+				);
+				throw attachTranslationErrorInfo(
+					new Error(`Blocked finishReason: ${finishReasonInfo.blockReason}`),
+					finishReasonInfo,
+				);
+			}
+
+			if (!result.text || !result.text.trim()) {
+				throw new Error("Model returned empty translation output.");
+			}
+
 			const translatedSegments = normalizeTranslatedSegmentCount(
-				splitTranslatedSegments(translatedText, context.translationDelimiter),
+				splitTranslatedSegments(result.text, translationDelimiter),
 				expectedSegments,
 			);
 
@@ -227,34 +377,214 @@ const retrieveTranslation = async (
 				`[translate][${context.runId}] Batch ${context.batchLabel} group ${context.groupIndex}/${context.totalGroups} attempt ${attempt}/${MAX_RETRIES} succeeded`,
 				{
 					durationMs: Date.now() - attemptStartedAt,
-					outputChars: translatedText.length,
+					outputChars: result.text.length,
 					outputSegments: translatedSegments.length,
+					splitDepth: depth,
 				},
 			);
 
 			return translatedSegments;
 		} catch (error) {
+			const classified = classifyTranslationError(error);
+			console.info(`[translate][${context.runId}] error classified`, {
+				batchLabel: context.batchLabel,
+				groupIndex: context.groupIndex,
+				category: classified.category,
+				retryable: classified.retryable,
+				splittable: classified.splittable,
+				blockReason: classified.blockReason,
+				providerResponseId: classified.providerResponseId,
+			});
+
 			console.error(
 				`[translate][${context.runId}] Batch ${context.batchLabel} group ${context.groupIndex}/${context.totalGroups} attempt ${attempt}/${MAX_RETRIES} failed`,
 				{
 					durationMs: Date.now() - attemptStartedAt,
+					splitDepth: depth,
+					category: classified.category,
 					...toErrorLog(error),
 				},
 			);
-			if (attempt < MAX_RETRIES) {
-				console.warn(
-					`[translate][${context.runId}] Batch ${context.batchLabel} group ${context.groupIndex}/${context.totalGroups} retrying in 1000ms`,
-				);
-				await sleep(1000);
-				continue;
+
+			if (!classified.retryable) {
+				throw attachTranslationErrorInfo(error, classified);
 			}
-			throw error;
+
+			const maxAttemptsForCategory = getMaxAttemptsForCategory(classified.category);
+			if (attempt >= maxAttemptsForCategory) {
+				throw attachTranslationErrorInfo(error, classified);
+			}
+
+			const retryDelayMs = getServerRetryDelayMs(attempt);
+			console.warn(
+				`[translate][${context.runId}] Batch ${context.batchLabel} group ${context.groupIndex}/${context.totalGroups} retrying in ${retryDelayMs}ms`,
+				{
+					category: classified.category,
+					attempt,
+					maxAttemptsForCategory,
+				},
+			);
+			await sleep(retryDelayMs);
 		} finally {
 			clearTimeout(timeoutId);
 		}
 	}
 
-	return [];
+	throw new Error("Translation failed after retries.");
+};
+
+const retrieveTranslationWithFallback = async (
+	segments: Segment[],
+	language: string,
+	context: TranslationRequestContext,
+	fallbackConfig: TranslationFallbackConfig,
+	depth = 0,
+): Promise<TranslationGroupResult> => {
+	const startedAt = Date.now();
+	try {
+		const translated = await retrieveTranslation(segments, language, context, depth);
+		const translatedSegments: TranslatedSegmentResult[] = translated.map(
+			(segmentText, index) => ({
+				text: segmentText,
+				blocked: false,
+				originalSegmentId: segments[index]?.id ?? index + 1,
+			}),
+		);
+		return {
+			segments: translatedSegments,
+			hasBlockedSegments: false,
+			blockedSegmentIds: [],
+			blockedReasons: [],
+			splitDepth: depth,
+		};
+	} catch (error) {
+		const classified = getTranslationErrorInfo(error) ?? classifyTranslationError(error);
+		const segmentIds = segments.map((segment) => segment.id);
+
+		console.info(`[translate][${context.runId}] error classified`, {
+			batchLabel: context.batchLabel,
+			groupIndex: context.groupIndex,
+			category: classified.category,
+			retryable: classified.retryable,
+			splittable: classified.splittable,
+			blockReason: classified.blockReason,
+			providerResponseId: classified.providerResponseId,
+			splitDepth: depth,
+		});
+
+		if (!classified.splittable) {
+			throw attachTranslationErrorInfo(error, classified);
+		}
+
+		console.warn(
+			`[translate][${context.runId}] content blocked`,
+			{
+				batchLabel: context.batchLabel,
+				groupIndex: context.groupIndex,
+				category: classified.category,
+				blockReason: classified.blockReason,
+				segmentIds,
+				segmentCount: segments.length,
+				splitDepth: depth,
+				providerResponseId: classified.providerResponseId,
+			},
+		);
+
+		if (segments.length === 1) {
+			const blockedSegment = applyIrreducibleBlockPolicy(
+				segments[0],
+				fallbackConfig.policy,
+				fallbackConfig.placeholder,
+				classified.blockReason,
+			);
+			console.warn(`[translate][${context.runId}] irreducible block`, {
+				batchLabel: context.batchLabel,
+				groupIndex: context.groupIndex,
+				segmentId: segments[0].id,
+				category: classified.category,
+				blockReason: classified.blockReason,
+				policy: fallbackConfig.policy,
+				originalTextLength: segments[0].text.length,
+				splitDepth: depth,
+			});
+			return {
+				segments: [blockedSegment],
+				hasBlockedSegments: true,
+				blockedSegmentIds: [segments[0].id],
+				blockedReasons: classified.blockReason ? [classified.blockReason] : [],
+				splitDepth: depth,
+			};
+		}
+
+		if (depth >= fallbackConfig.maxSplitDepth) {
+			console.warn(`[translate][${context.runId}] split depth limit reached`, {
+				batchLabel: context.batchLabel,
+				groupIndex: context.groupIndex,
+				maxSplitDepth: fallbackConfig.maxSplitDepth,
+				segmentCount: segments.length,
+				segmentIds,
+				category: classified.category,
+				blockReason: classified.blockReason,
+			});
+			const blockedSegments = segments.map((segment) =>
+				applyIrreducibleBlockPolicy(
+					segment,
+					fallbackConfig.policy,
+					fallbackConfig.placeholder,
+					classified.blockReason,
+				),
+			);
+			return {
+				segments: blockedSegments,
+				hasBlockedSegments: true,
+				blockedSegmentIds: segmentIds,
+				blockedReasons: classified.blockReason ? [classified.blockReason] : [],
+				splitDepth: depth,
+			};
+		}
+
+		const middleIndex = Math.ceil(segments.length / 2);
+		const leftSegments = segments.slice(0, middleIndex);
+		const rightSegments = segments.slice(middleIndex);
+
+		console.info(`[translate][${context.runId}] splitting group`, {
+			batchLabel: context.batchLabel,
+			groupIndex: context.groupIndex,
+			originalSize: segments.length,
+			leftSize: leftSegments.length,
+			rightSize: rightSegments.length,
+			depth,
+			segmentIds,
+		});
+
+		const leftResult = await retrieveTranslationWithFallback(
+			leftSegments,
+			language,
+			context,
+			fallbackConfig,
+			depth + 1,
+		);
+		const rightResult = await retrieveTranslationWithFallback(
+			rightSegments,
+			language,
+			context,
+			fallbackConfig,
+			depth + 1,
+		);
+
+		const merged = mergeGroupResults(leftResult, rightResult, depth);
+		if (depth === 0) {
+			console.info(`[translate][${context.runId}] split fallback complete`, {
+				batchLabel: context.batchLabel,
+				groupIndex: context.groupIndex,
+				totalSegments: segments.length,
+				blockedCount: merged.blockedSegmentIds.length,
+				splitDepth: merged.splitDepth,
+				durationMs: Date.now() - startedAt,
+			});
+		}
+		return merged;
+	}
 };
 
 export async function POST(request: Request) {
@@ -278,50 +608,39 @@ export async function POST(request: Request) {
 
 	try {
 		if (!process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
-			return new Response(
-				JSON.stringify({
+			return toJsonResponse(
+				{
 					error:
 						"Missing GOOGLE_GENERATIVE_AI_API_KEY. Set it in Netlify env or .env.local.",
+					code: "CONFIG_ERROR",
 					runId,
-				}),
-				{
-					status: 500,
-					headers: {
-						"Content-Type": "application/json",
-						"x-translation-run-id": runId,
-					},
 				},
+				500,
+				runId,
 			);
 		}
 		if (runtimeConfigError) {
-			return new Response(
-				JSON.stringify({
-					error: runtimeConfigError,
-					runId,
-				}),
+			return toJsonResponse(
 				{
-					status: 500,
-					headers: {
-						"Content-Type": "application/json",
-						"x-translation-run-id": runId,
-					},
+					error: runtimeConfigError,
+					code: "CONFIG_ERROR",
+					runId,
 				},
+				500,
+				runId,
 			);
 		}
+
 		const payload = parsePayload(await request.json().catch(() => null));
 		if (!payload) {
-			return new Response(
-				JSON.stringify({
-					error: "Invalid request. Expected content and language.",
-					runId,
-				}),
+			return toJsonResponse(
 				{
-					status: 400,
-					headers: {
-						"Content-Type": "application/json",
-						"x-translation-run-id": runId,
-					},
+					error: "Invalid request. Expected content and language.",
+					code: "INVALID_REQUEST",
+					runId,
 				},
+				400,
+				runId,
 			);
 		}
 
@@ -334,6 +653,8 @@ export async function POST(request: Request) {
 			thinkingLevel: runtimeConfig.thinkingLevel,
 			isGemini3Model: runtimeConfig.isGemini3Model,
 			maxTokensPerRequest: runtimeConfig.maxTokensPerRequest,
+			prohibitedContentPolicy: runtimeConfig.prohibitedContentPolicy,
+			maxSplitDepth: runtimeConfig.maxSplitDepth,
 		});
 
 		const segments = content
@@ -347,18 +668,14 @@ export async function POST(request: Request) {
 			}));
 
 		if (!segments.length) {
-			return new Response(
-				JSON.stringify({
-					error: "No valid SRT segments found in request content.",
-					runId,
-				}),
+			return toJsonResponse(
 				{
-					status: 400,
-					headers: {
-						"Content-Type": "application/json",
-						"x-translation-run-id": runId,
-					},
+					error: "No valid SRT segments found in request content.",
+					code: "INVALID_REQUEST",
+					runId,
 				},
+				400,
+				runId,
 			);
 		}
 
@@ -372,79 +689,126 @@ export async function POST(request: Request) {
 			maxTokensPerRequest: runtimeConfig.maxTokensPerRequest,
 		});
 
-		let currentIndex = 0;
-		const encoder = new TextEncoder();
+		const translatedBlocks: string[] = [];
+		const blockedSegmentIds: number[] = [];
+		const blockedReasons = new Set<string>();
+		let outputSegments = 0;
 
-		const stream = new ReadableStream({
-			async start(controller) {
-				const streamStartedAt = Date.now();
-				try {
-					for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
-						const group = groups[groupIndex];
-						const translationDelimiter = `|||SRT_SEGMENT_${crypto
-							.randomUUID()
-							.replace(/-/g, "")}|||`;
-						const text = group.map((segment) => segment.text).join(translationDelimiter);
-						const translatedSegments = await retrieveTranslation(
-							text,
-							language,
-							group.length,
-							{
-								runId,
-								batchLabel,
-								groupIndex: groupIndex + 1,
-								totalGroups: groups.length,
-								translationDelimiter,
-								modelName: runtimeConfig.modelName,
-								thinkingLevel: runtimeConfig.thinkingLevel,
-								isGemini3Model: runtimeConfig.isGemini3Model,
-							},
-						);
+		for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+			const group = groups[groupIndex];
+			const groupResult = await retrieveTranslationWithFallback(
+				group,
+				language,
+				{
+					runId,
+					batchLabel,
+					groupIndex: groupIndex + 1,
+					totalGroups: groups.length,
+					modelName: runtimeConfig.modelName,
+					thinkingLevel: runtimeConfig.thinkingLevel,
+					isGemini3Model: runtimeConfig.isGemini3Model,
+				},
+				{
+					policy: runtimeConfig.prohibitedContentPolicy,
+					placeholder: runtimeConfig.prohibitedContentPlaceholder,
+					maxSplitDepth: runtimeConfig.maxSplitDepth,
+				},
+			);
 
-						for (const segment of translatedSegments) {
-							const originalSegment = segments[currentIndex];
-							currentIndex += 1;
-							if (!originalSegment) {
-								continue;
-							}
+			if (groupResult.segments.length !== group.length) {
+				throw new Error(
+					`Unexpected translated output shape. Expected ${group.length} segments, received ${groupResult.segments.length}.`,
+				);
+			}
 
-							const srt = `${originalSegment.id}\n${originalSegment.timestamp}\n${segment.trim()}\n\n`;
-							controller.enqueue(encoder.encode(srt));
-						}
-					}
+			for (let segmentIndex = 0; segmentIndex < group.length; segmentIndex += 1) {
+				const originalSegment = group[segmentIndex];
+				const translatedSegment = groupResult.segments[segmentIndex];
+				const translatedText = translatedSegment?.text?.trim() ?? "";
+				translatedBlocks.push(
+					`${originalSegment.id}\n${originalSegment.timestamp}\n${translatedText}\n\n`,
+				);
+				outputSegments += 1;
 
-					console.info(`[translate][${runId}] Batch ${batchLabel} streamed`, {
-						durationMs: Date.now() - streamStartedAt,
-						outputSegments: currentIndex,
-					});
-					controller.close();
-				} catch (streamError) {
-					console.error(`[translate][${runId}] Batch ${batchLabel} stream error`, {
-						...toErrorLog(streamError),
-					});
-					controller.error(streamError);
+				if (translatedSegment?.blocked) {
+					blockedSegmentIds.push(originalSegment.id);
 				}
-			},
+				if (translatedSegment?.blockReason) {
+					blockedReasons.add(translatedSegment.blockReason);
+				}
+			}
+
+			if (groupResult.hasBlockedSegments) {
+				console.info(`[translate][${runId}] batch partial success`, {
+					batchLabel,
+					groupIndex: groupIndex + 1,
+					totalSegments: group.length,
+					translatedCount:
+						group.length - groupResult.blockedSegmentIds.length,
+					blockedCount: groupResult.blockedSegmentIds.length,
+					blockedSegmentIds: groupResult.blockedSegmentIds,
+					blockReasons: groupResult.blockedReasons,
+				});
+			}
+		}
+
+		if (outputSegments !== segments.length) {
+			throw new Error(
+				`Unexpected translated output shape. Expected ${segments.length} segments, received ${outputSegments}.`,
+			);
+		}
+
+		const uniqueBlockedSegmentIds = Array.from(new Set(blockedSegmentIds));
+		const translationStatus = uniqueBlockedSegmentIds.length > 0 ? "partial" : "complete";
+		const headers: Record<string, string> = {
+			"Content-Type": "text/plain; charset=utf-8",
+			"Cache-Control": "no-store",
+			"x-translation-run-id": runId,
+			"x-translation-status": translationStatus,
+		};
+
+		if (uniqueBlockedSegmentIds.length > 0) {
+			headers["x-translation-blocked-segments"] = uniqueBlockedSegmentIds.join(",");
+		}
+		if (blockedReasons.size > 0) {
+			headers["x-translation-blocked-reasons"] = Array.from(blockedReasons).join(",");
+		}
+
+		console.info(`[translate][${runId}] Batch ${batchLabel} completed`, {
+			durationMs: Date.now() - batchStartedAt,
+			outputSegments,
+			status: translationStatus,
+			blockedCount: uniqueBlockedSegmentIds.length,
+			blockedSegmentIds: uniqueBlockedSegmentIds,
+			blockReasons: Array.from(blockedReasons),
 		});
 
-		return new Response(stream, {
-			headers: {
-				"Content-Type": "text/plain; charset=utf-8",
-				"Cache-Control": "no-store",
-				"x-translation-run-id": runId,
-			},
+		return new Response(translatedBlocks.join(""), {
+			headers,
 		});
 	} catch (error) {
+		const classified = getTranslationErrorInfo(error) ?? classifyTranslationError(error);
+		const code = translationErrorCategoryToCode(classified.category);
+		const status = classified.category === "timeout" ? 504 : 500;
+		const responseBody: Record<string, unknown> = {
+			error: buildErrorMessage(classified),
+			code,
+			runId,
+		};
+		if (classified.blockReason) {
+			responseBody.blockReasons = [classified.blockReason];
+		}
+
 		console.error(`[translate][${runId}] Batch ${batchLabel} failed`, {
 			durationMs: Date.now() - batchStartedAt,
+			category: classified.category,
+			retryable: classified.retryable,
+			splittable: classified.splittable,
+			blockReason: classified.blockReason,
+			providerResponseId: classified.providerResponseId,
 			...toErrorLog(error),
 		});
-		return new Response(JSON.stringify({ error: "Error during translation", runId }), {
-			status: 500,
-			headers: {
-				"Content-Type": "application/json",
-				"x-translation-run-id": runId,
-			},
-		});
+
+		return toJsonResponse(responseBody, status, runId);
 	}
 }
