@@ -2,6 +2,9 @@ const DEFAULT_GEMINI_MODEL_NAME = "gemini-3-flash-preview";
 const DEFAULT_GEMINI_BATCH_TOKENS = 350;
 const MIN_GEMINI_BATCH_TOKENS = 100;
 const MAX_GEMINI_BATCH_TOKENS = 2_000;
+const DEFAULT_MAX_PARALLEL = 5;
+const MIN_MAX_PARALLEL = 1;
+const MAX_MAX_PARALLEL = 20;
 const GEMINI_THINKING_LEVELS = ["minimal", "low", "medium", "high"] as const;
 const DEFAULT_GEMINI_THINKING_LEVEL = "low";
 
@@ -10,6 +13,7 @@ export type GeminiThinkingLevel = (typeof GEMINI_THINKING_LEVELS)[number];
 export type TranslationRuntimeConfig = {
 	modelName: string;
 	maxTokensPerRequest: number;
+	maxParallel: number;
 	thinkingLevel: GeminiThinkingLevel;
 	isGemini3Model: boolean;
 };
@@ -46,6 +50,7 @@ export function resolveTranslationRuntimeConfig(): TranslationRuntimeConfigResul
 				config: {
 					modelName,
 					maxTokensPerRequest: DEFAULT_GEMINI_BATCH_TOKENS,
+					maxParallel: DEFAULT_MAX_PARALLEL,
 					thinkingLevel,
 					isGemini3Model,
 				},
@@ -66,6 +71,7 @@ export function resolveTranslationRuntimeConfig(): TranslationRuntimeConfigResul
 				config: {
 					modelName,
 					maxTokensPerRequest,
+					maxParallel: DEFAULT_MAX_PARALLEL,
 					thinkingLevel,
 					isGemini3Model,
 				},
@@ -78,6 +84,7 @@ export function resolveTranslationRuntimeConfig(): TranslationRuntimeConfigResul
 				config: {
 					modelName,
 					maxTokensPerRequest,
+					maxParallel: DEFAULT_MAX_PARALLEL,
 					thinkingLevel,
 					isGemini3Model,
 				},
@@ -88,10 +95,24 @@ export function resolveTranslationRuntimeConfig(): TranslationRuntimeConfigResul
 		maxTokensPerRequest = parsed;
 	}
 
+	const maxParallelRaw = getFirstDefinedEnvValue(["TRANSLATION_MAX_PARALLEL"]);
+	let maxParallel = DEFAULT_MAX_PARALLEL;
+	if (maxParallelRaw) {
+		const parsed = Number.parseInt(maxParallelRaw, 10);
+		if (
+			Number.isFinite(parsed) &&
+			parsed >= MIN_MAX_PARALLEL &&
+			parsed <= MAX_MAX_PARALLEL
+		) {
+			maxParallel = parsed;
+		}
+	}
+
 	return {
 		config: {
 			modelName,
 			maxTokensPerRequest,
+			maxParallel,
 			thinkingLevel,
 			isGemini3Model,
 		},
