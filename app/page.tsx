@@ -10,6 +10,7 @@ import Timestamp from "@/components/Timestamp";
 import type { Chunk, Segment } from "@/types";
 import { parseSegment, parseTimestamp, applyOffsetToTimestampLine } from "@/lib/client";
 import { groupSegmentsByTokenLength } from "@/lib/srt";
+import { buildZipArchive } from "@/lib/zip";
 
 function classNames(...classes: string[]) {
 	return classes.filter(Boolean).join(" ");
@@ -33,12 +34,40 @@ type TranslationProgress = {
 	activeRequest: number;
 };
 
+type FileResultStatus = "pending" | "translating" | "success" | "failed";
+type FileResult = {
+	filename: string;
+	content: string;
+	status: FileResultStatus;
+	translatedContent?: string;
+	outputFilename?: string;
+	error?: string;
+};
+
+type BulkProgress = {
+	totalFiles: number;
+	completedFiles: number;
+	activeFileIndex: number;
+};
+
+type QueueItem = {
+	filename: string;
+	content: string;
+	resultIndex?: number;
+};
+
 const EMPTY_PROGRESS: TranslationProgress = {
 	totalSegments: 0,
 	translatedSegments: 0,
 	totalRequests: 0,
 	completedRequests: 0,
 	activeRequest: 0,
+};
+
+const EMPTY_BULK_PROGRESS: BulkProgress = {
+	totalFiles: 0,
+	completedFiles: 0,
+	activeFileIndex: -1,
 };
 
 function serializeSegment(segment: Segment): string {
@@ -138,9 +167,12 @@ async function requestTranslationBatch(
 	throw lastError || new Error("Translation batch failed after retries.");
 }
 
-const triggerFileDownload = (filename: string, content: string) => {
+const triggerFileDownload = (filename: string, content: string | Blob) => {
 	const element = document.createElement("a");
-	const file = new Blob([content], { type: "text/plain" });
+	const file =
+		typeof content === "string"
+			? new Blob([content], { type: "text/plain" })
+			: content;
 	const fileUrl = URL.createObjectURL(file);
 	element.href = fileUrl;
 	element.download = filename;
@@ -148,6 +180,15 @@ const triggerFileDownload = (filename: string, content: string) => {
 	element.click();
 	element.remove();
 	URL.revokeObjectURL(fileUrl);
+};
+
+const triggerFileDownloadFromUrl = (filename: string, fileUrl: string) => {
+	const element = document.createElement("a");
+	element.href = fileUrl;
+	element.download = filename;
+	document.body.appendChild(element);
+	element.click();
+	element.remove();
 };
 
 function toPercent(value: number, total: number): number {
@@ -161,6 +202,36 @@ function formatElapsedTime(elapsedSeconds: number): string {
 		.padStart(2, "0");
 	const seconds = (elapsedSeconds % 60).toString().padStart(2, "0");
 	return `${minutes}:${seconds}`;
+}
+
+function getFileStatusLabel(status: FileResultStatus): string {
+	switch (status) {
+		case "pending":
+			return "Pending";
+		case "translating":
+			return "Translating";
+		case "success":
+			return "Success";
+		case "failed":
+			return "Failed";
+		default:
+			return status;
+	}
+}
+
+function getFileStatusClasses(status: FileResultStatus): string {
+	switch (status) {
+		case "pending":
+			return "border-slate-200 bg-slate-100 text-slate-600";
+		case "translating":
+			return "animate-pulse border-indigo-200 bg-indigo-50 text-indigo-700";
+		case "success":
+			return "border-emerald-200 bg-emerald-50 text-emerald-700";
+		case "failed":
+			return "border-rose-200 bg-rose-50 text-rose-700";
+		default:
+			return "border-slate-200 bg-slate-100 text-slate-600";
+	}
 }
 
 function ProgressRow({
@@ -224,6 +295,13 @@ export default function Home() {
 	const [elapsedSeconds, setElapsedSeconds] = React.useState<number>(0);
 	const [activeMode, setActiveMode] = React.useState<AppMode>("translate");
 	const [activeOffsetMs, setActiveOffsetMs] = React.useState<number>(0);
+	const [fileResults, setFileResults] = React.useState<FileResult[]>([]);
+	const [bulkProgress, setBulkProgress] =
+		React.useState<BulkProgress>(EMPTY_BULK_PROGRESS);
+	const [zipDownload, setZipDownload] = React.useState<{
+		filename: string;
+		url: string;
+	} | null>(null);
 
 	React.useEffect(() => {
 		if (status !== "busy" || startedAt === null) {
@@ -265,11 +343,22 @@ export default function Home() {
 		})();
 	}, []);
 
+	const clearZipDownload = React.useCallback(() => {
+		setZipDownload((prev) => {
+			if (prev) {
+				URL.revokeObjectURL(prev.url);
+			}
+			return null;
+		});
+	}, []);
+
 	const resetRunState = React.useCallback(() => {
 		setStartedAt(null);
 		setElapsedSeconds(0);
 		setProgress(EMPTY_PROGRESS);
-	}, []);
+		setBulkProgress(EMPTY_BULK_PROGRESS);
+		clearZipDownload();
+	}, [clearZipDownload]);
 
 	const resetToIdle = React.useCallback(() => {
 		setStatus("idle");
@@ -278,6 +367,8 @@ export default function Home() {
 		setActiveFilename("");
 		setActiveLanguage("");
 		setActiveOffsetMs(0);
+		setFileResults([]);
+		setBulkProgress(EMPTY_BULK_PROGRESS);
 		resetRunState();
 	}, [resetRunState]);
 
@@ -360,180 +451,345 @@ export default function Home() {
 		return { content, translatedSegmentCount };
 	}
 
-	async function handleSubmit(content: string, language: string, filename: string) {
+	async function translateSingleFile(
+		content: string,
+		language: string,
+		filename: string,
+	): Promise<{ translatedContent: string; outputFilename: string }> {
+		if (!content) {
+			throw new Error("No content provided.");
+		}
+
+		setActiveFilename(filename);
+		setActiveLanguage(language);
+		setTranslatedChunks([]);
+		setOriginalChunks([]);
+		setProgress(EMPTY_PROGRESS);
+
+		const segments = splitSrtBlocks(content);
+		if (!segments.length) {
+			throw new Error("Invalid SRT file format. Please check your file.");
+		}
+
+		let originalSegments: Segment[] = [];
 		try {
-			if (!content) {
-				console.error("No content provided");
-				return;
+			originalSegments = normalizeSegmentIds(segments.map(parseSegment));
+			if (!originalSegments.length) {
+				throw new Error("No valid subtitle segments found.");
 			}
+			setOriginalChunks(
+				originalSegments.map((seg) => {
+					const { start, end } = parseTimestamp(seg.timestamp);
+					return {
+						index: seg.id.toString(),
+						start,
+						end,
+						text: seg.text,
+					};
+				}),
+			);
+		} catch (error) {
+			console.error("Parsing error:", error);
+			throw new Error("Error parsing SRT file. Please check the file format.");
+		}
 
-			setStatus("busy");
-			setStartedAt(Date.now());
-			setElapsedSeconds(0);
-			setActiveFilename(filename);
-			setActiveLanguage(language);
-			setTranslatedChunks([]);
-			setOriginalChunks([]);
-			setProgress(EMPTY_PROGRESS);
+		const requestGroups = groupSegmentsByTokenLength(
+			originalSegments,
+			maxTokensPerTranslationRequest,
+		);
 
-			const segments = splitSrtBlocks(content);
+		setProgress({
+			totalSegments: originalSegments.length,
+			translatedSegments: 0,
+			totalRequests: requestGroups.length,
+			completedRequests: 0,
+			activeRequest: requestGroups.length ? 1 : 0,
+		});
 
-			if (!segments.length) {
-				setStatus("idle");
-				resetRunState();
-				alert("Invalid SRT file format. Please check your file.");
-				return;
-			}
+		let translatedContent = "";
+		let translatedSegmentCount = 0;
+		const translationRunId = crypto.randomUUID();
 
-			let originalSegments: Segment[] = [];
-			try {
-				originalSegments = normalizeSegmentIds(segments.map(parseSegment));
-				if (!originalSegments.length) {
-					throw new Error("No valid subtitle segments found.");
-				}
-				setOriginalChunks(
-					originalSegments.map((seg) => {
-						const { start, end } = parseTimestamp(seg.timestamp);
-						return {
-							index: seg.id.toString(),
-							start,
-							end,
-							text: seg.text,
-						};
-					}),
-				);
-			} catch (error) {
-				setStatus("idle");
-				resetRunState();
-				alert("Error parsing SRT file. Please check the file format.");
-				console.error("Parsing error:", error);
-				return;
-			}
+		for (let requestIndex = 0; requestIndex < requestGroups.length; requestIndex += 1) {
+			const requestGroup = requestGroups[requestIndex];
+			setProgress((prev) => ({
+				...prev,
+				activeRequest: requestIndex + 1,
+			}));
 
-			const requestGroups = groupSegmentsByTokenLength(
-				originalSegments,
-				maxTokensPerTranslationRequest,
+			const requestContent = requestGroup.map(serializeSegment).join("\n\n");
+			const response = await requestTranslationBatch(
+				requestContent,
+				language,
+				translationRunId,
+				requestIndex + 1,
+				requestGroups.length,
 			);
 
-			setProgress({
-				totalSegments: originalSegments.length,
-				translatedSegments: 0,
-				totalRequests: requestGroups.length,
-				completedRequests: 0,
-				activeRequest: requestGroups.length ? 1 : 0,
+			const batchResult = await handleStream(response, () => {
+				setProgress((prev) => ({
+					...prev,
+					translatedSegments: Math.min(prev.totalSegments, prev.translatedSegments + 1),
+				}));
 			});
 
-			let translatedContent = "";
-			let translatedSegmentCount = 0;
-			const translationRunId = crypto.randomUUID();
-
-			for (let requestIndex = 0; requestIndex < requestGroups.length; requestIndex += 1) {
-				const requestGroup = requestGroups[requestIndex];
-				setProgress((prev) => ({
-					...prev,
-					activeRequest: requestIndex + 1,
-				}));
-
-				const requestContent = requestGroup.map(serializeSegment).join("\n\n");
-				const response = await requestTranslationBatch(
-					requestContent,
-					language,
-					translationRunId,
-					requestIndex + 1,
-					requestGroups.length,
-				);
-
-				const batchResult = await handleStream(response, () => {
-					setProgress((prev) => ({
-						...prev,
-						translatedSegments: Math.min(
-							prev.totalSegments,
-							prev.translatedSegments + 1,
-						),
-					}));
-				});
-
-				if (batchResult.translatedSegmentCount !== requestGroup.length) {
-					throw new Error(
-						`Incomplete translation batch. Expected ${requestGroup.length}, received ${batchResult.translatedSegmentCount}.`,
-					);
-				}
-
-				setProgress((prev) => ({
-					...prev,
-					completedRequests: Math.min(prev.totalRequests, requestIndex + 1),
-				}));
-				translatedSegmentCount += batchResult.translatedSegmentCount;
-				translatedContent += `${batchResult.content.trimEnd()}\n\n`;
-				if (
-					INTER_BATCH_DELAY_MS > 0 &&
-					requestIndex < requestGroups.length - 1
-				) {
-					await sleep(INTER_BATCH_DELAY_MS);
-				}
-			}
-
-			if (translatedSegmentCount !== originalSegments.length) {
+			if (batchResult.translatedSegmentCount !== requestGroup.length) {
 				throw new Error(
-					`Incomplete translation. Expected ${originalSegments.length}, received ${translatedSegmentCount}.`,
+					`Incomplete translation batch. Expected ${requestGroup.length}, received ${batchResult.translatedSegmentCount}.`,
 				);
 			}
 
-			// Define all known suffixes
-			const knownSuffixes = [".eng", ".spa", ".pop"];
+			setProgress((prev) => ({
+				...prev,
+				completedRequests: Math.min(prev.totalRequests, requestIndex + 1),
+			}));
+			translatedSegmentCount += batchResult.translatedSegmentCount;
+			translatedContent += `${batchResult.content.trimEnd()}\n\n`;
+			if (INTER_BATCH_DELAY_MS > 0 && requestIndex < requestGroups.length - 1) {
+				await sleep(INTER_BATCH_DELAY_MS);
+			}
+		}
 
-			// First, remove any existing known suffix from the filename
-			let baseName = filename.replace(/\.srt$/i, "");
+		if (translatedSegmentCount !== originalSegments.length) {
+			throw new Error(
+				`Incomplete translation. Expected ${originalSegments.length}, received ${translatedSegmentCount}.`,
+			);
+		}
 
-			// Check if the filename already ends with one of the known suffixes
-			for (const suffix of knownSuffixes) {
-				if (baseName.toLowerCase().endsWith(suffix.toLowerCase())) {
-					// Remove the suffix from the base name
-					baseName = baseName.slice(0, -suffix.length);
-					break;
+		// Define all known suffixes
+		const knownSuffixes = [".eng", ".spa", ".pop"];
+
+		// First, remove any existing known suffix from the filename
+		let baseName = filename.replace(/\.srt$/i, "");
+
+		// Check if the filename already ends with one of the known suffixes
+		for (const suffix of knownSuffixes) {
+			if (baseName.toLowerCase().endsWith(suffix.toLowerCase())) {
+				// Remove the suffix from the base name
+				baseName = baseName.slice(0, -suffix.length);
+				break;
+			}
+		}
+
+		// Determine the language suffix based on the selected language
+		let languageSuffix = "";
+		if (language === "Spanish (Spain)") {
+			languageSuffix = ".spa";
+		} else if (language === "English") {
+			languageSuffix = ".eng";
+		} else if (language === "Portuguese (Portugal)") {
+			languageSuffix = ".pop";
+		}
+		// For custom languages, no suffix is added
+
+		// Create the new filename with the appropriate suffix
+		const outputFilename = `${baseName}${languageSuffix}.srt`;
+
+		if (!translatedContent.trim()) {
+			throw new Error("Error occurred while reading the translated output.");
+		}
+
+		setProgress((prev) => ({
+			...prev,
+			translatedSegments: prev.totalSegments,
+			completedRequests: prev.totalRequests,
+			activeRequest: prev.totalRequests,
+		}));
+
+		return { translatedContent, outputFilename };
+	}
+
+	async function finalizeBulkRun(results: FileResult[], language: string) {
+		const successes = results.filter(
+			(result): result is FileResult &
+				Required<Pick<FileResult, "translatedContent" | "outputFilename">> =>
+				result.status === "success" &&
+				typeof result.translatedContent === "string" &&
+				typeof result.outputFilename === "string",
+		);
+
+		setFileResults(results);
+		setBulkProgress({
+			totalFiles: results.length,
+			completedFiles: results.length,
+			activeFileIndex: -1,
+		});
+
+		if (!successes.length) {
+			setStatus("idle");
+			resetRunState();
+			alert("All translations failed. See console for details.");
+			return;
+		}
+
+		if (results.length === 1 && successes.length === 1) {
+			clearZipDownload();
+			triggerFileDownload(successes[0].outputFilename, successes[0].translatedContent);
+			setStatus("done");
+			return;
+		}
+
+		// Keep successful contents in memory to enable one-click ZIP redownload.
+		const { blob, filename } = await buildZipArchive(
+			successes.map((success) => ({
+				outputFilename: success.outputFilename,
+				translatedContent: success.translatedContent,
+			})),
+			language,
+		);
+
+		triggerFileDownload(filename, blob);
+		setZipDownload((prev) => {
+			if (prev) {
+				URL.revokeObjectURL(prev.url);
+			}
+			return {
+				filename,
+				url: URL.createObjectURL(blob),
+			};
+		});
+		setStatus("done");
+	}
+
+	async function handleBulkSubmit(queue: QueueItem[], language: string) {
+		if (!queue.length) {
+			return;
+		}
+
+		if (queue.length === 1 && !queue[0].content) {
+			console.error("No content provided");
+			return;
+		}
+
+		const hasIndexedItems = queue.some((item) => Number.isInteger(item.resultIndex));
+		const initialResults: FileResult[] =
+			hasIndexedItems && fileResults.length
+				? fileResults.map((result) => ({ ...result }))
+				: queue.map((item) => ({
+						filename: item.filename,
+						content: item.content,
+						status: "pending" as const,
+				  }));
+
+		if (hasIndexedItems) {
+			for (const item of queue) {
+				const targetIndex = item.resultIndex ?? -1;
+				if (targetIndex < 0 || targetIndex >= initialResults.length) {
+					continue;
 				}
+
+				initialResults[targetIndex] = {
+					...initialResults[targetIndex],
+					filename: item.filename,
+					content: item.content,
+					status: "pending",
+					error: undefined,
+				};
 			}
+		}
 
-			// Determine the language suffix based on the selected language
-			let languageSuffix = "";
-			if (language === "Spanish (Spain)") {
-				languageSuffix = ".spa";
-			} else if (language === "English") {
-				languageSuffix = ".eng";
-			} else if (language === "Portuguese (Portugal)") {
-				languageSuffix = ".pop";
-			}
-			// For custom languages, no suffix is added
+		setFileResults(initialResults);
+		setStatus("busy");
+		setStartedAt(Date.now());
+		setElapsedSeconds(0);
 
-			// Create the new filename with the appropriate suffix
-			const outputFilename = `${baseName}${languageSuffix}.srt`;
+		const initialCompletedFiles = initialResults.filter(
+			(result) => result.status === "success",
+		).length;
+		setBulkProgress({
+			totalFiles: initialResults.length,
+			completedFiles: initialCompletedFiles,
+			activeFileIndex: -1,
+		});
 
-			if (translatedContent.trim()) {
-				setProgress((prev) => ({
+		try {
+			const nextResults = [...initialResults];
+			let completedFiles = initialCompletedFiles;
+
+			for (let queueIndex = 0; queueIndex < queue.length; queueIndex += 1) {
+				const queueItem = queue[queueIndex];
+				const targetIndex = queueItem.resultIndex ?? queueIndex;
+				if (targetIndex < 0 || targetIndex >= nextResults.length) {
+					continue;
+				}
+
+				nextResults[targetIndex] = {
+					...nextResults[targetIndex],
+					status: "translating",
+					error: undefined,
+				};
+				setFileResults([...nextResults]);
+				setBulkProgress((prev) => ({
 					...prev,
-					translatedSegments: prev.totalSegments,
-					completedRequests: prev.totalRequests,
-					activeRequest: prev.totalRequests,
+					activeFileIndex: targetIndex,
 				}));
-				setStartedAt(null);
-				setStatus("done");
-				triggerFileDownload(outputFilename, translatedContent);
-			} else {
-				setStatus("idle");
-				resetRunState();
-				alert("Error occurred while reading the translated output.");
+
+				try {
+					const { translatedContent, outputFilename } = await translateSingleFile(
+						queueItem.content,
+						language,
+						queueItem.filename,
+					);
+					nextResults[targetIndex] = {
+						...nextResults[targetIndex],
+						status: "success",
+						translatedContent,
+						outputFilename,
+						error: undefined,
+					};
+				} catch (error) {
+					console.error(`Translation failed for ${queueItem.filename}`, error);
+					nextResults[targetIndex] = {
+						...nextResults[targetIndex],
+						status: "failed",
+						error:
+							error instanceof Error
+								? error.message
+								: "Unknown translation error.",
+					};
+				}
+
+				completedFiles += 1;
+				setFileResults([...nextResults]);
+				setBulkProgress((prev) => ({
+					...prev,
+					completedFiles,
+					activeFileIndex: targetIndex,
+				}));
 			}
+
+			await finalizeBulkRun(nextResults, language);
 		} catch (error) {
 			setStatus("idle");
 			resetRunState();
 			alert(
 				"Translation did not complete. Please retry with the latest app version.",
 			);
-			console.error(
-				"Error during file reading and translation request:",
-				error,
-			);
+			console.error("Error during bulk translation run:", error);
+		} finally {
+			setStartedAt(null);
 		}
+	}
+
+	async function handleRetryFailed() {
+		if (!activeLanguage) {
+			return;
+		}
+
+		const retryQueue = fileResults
+			.map((result, index) => ({ result, index }))
+			.filter(({ result }) => result.status === "failed")
+			.map(({ result, index }) => ({
+				filename: result.filename,
+				content: result.content,
+				resultIndex: index,
+			}));
+
+		if (!retryQueue.length) {
+			return;
+		}
+
+		await handleBulkSubmit(retryQueue, activeLanguage);
 	}
 
 	function handleOffset(content: string, offsetMs: number, filename: string) {
@@ -584,6 +840,18 @@ export default function Home() {
 		progress.completedRequests,
 		progress.totalRequests,
 	);
+	const fileProgress = toPercent(
+		bulkProgress.completedFiles,
+		bulkProgress.totalFiles,
+	);
+	const showBulkProgress = bulkProgress.totalFiles > 1;
+	const successCount = fileResults.filter((result) => result.status === "success").length;
+	const failureCount = fileResults.filter((result) => result.status === "failed").length;
+	const activeFileNumber =
+		bulkProgress.activeFileIndex >= 0
+			? bulkProgress.activeFileIndex + 1
+			: Math.min(bulkProgress.completedFiles, bulkProgress.totalFiles);
+
 	const titles: Record<AppMode, Record<TranslationStatus, string>> = {
 		translate: {
 			idle: "Translate any SRT to any language",
@@ -608,6 +876,18 @@ export default function Home() {
 			done: "Your file has been downloaded with adjusted timestamps. Process another file whenever you are ready.",
 		},
 	};
+	const headingTitle =
+		activeMode === "translate" && status === "done" && showBulkProgress
+			? failureCount
+				? "Bulk translation finished with failures"
+				: "Bulk translation complete"
+			: titles[activeMode][status];
+	const headingSubtitle =
+		activeMode === "translate" && status === "done" && showBulkProgress
+			? failureCount
+				? "Successful files are packaged in a ZIP. Retry failed files directly from the results panel."
+				: "All files were translated and archived into a single ZIP download."
+			: subtitleTexts[activeMode][status];
 
 	if (configOk === false) {
 		return (
@@ -661,10 +941,10 @@ export default function Home() {
 									roaldDahl.className,
 								)}
 							>
-								{titles[activeMode][status]}
+								{headingTitle}
 							</h1>
 							<p className="max-w-3xl text-sm text-slate-600 md:text-base">
-								{subtitleTexts[activeMode][status]}
+								{headingSubtitle}
 							</p>
 							{status === "idle" && (
 								<div className="inline-flex gap-1 rounded-xl bg-slate-100 p-1">
@@ -710,7 +990,7 @@ export default function Home() {
 				)}
 
 				{configOk === true && status === "idle" && activeMode === "translate" && (
-					<Form onSubmit={handleSubmit} />
+					<Form onSubmit={handleBulkSubmit} />
 				)}
 				{configOk === true && status === "idle" && activeMode === "offset" && (
 					<OffsetForm onSubmit={handleOffset} />
@@ -719,7 +999,12 @@ export default function Home() {
 				{configOk === true && status === "busy" && activeMode === "translate" && (
 					<>
 						<section className="rounded-3xl border border-slate-200 bg-white/85 p-6 shadow-xl backdrop-blur md:p-8">
-							<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+							<div
+								className={classNames(
+									"grid gap-3 sm:grid-cols-2",
+									showBulkProgress ? "lg:grid-cols-5" : "lg:grid-cols-4",
+								)}
+							>
 								<div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
 									<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
 										Translated segments
@@ -752,6 +1037,16 @@ export default function Home() {
 										{formatElapsedTime(elapsedSeconds)}
 									</p>
 								</div>
+								{showBulkProgress && (
+									<div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+										<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+											Files
+										</p>
+										<p className="mt-2 text-2xl font-bold text-slate-900">
+											{bulkProgress.completedFiles}/{bulkProgress.totalFiles}
+										</p>
+									</div>
+								)}
 							</div>
 
 							<div className="mt-6 space-y-4">
@@ -767,19 +1062,84 @@ export default function Home() {
 									total={progress.totalRequests}
 									percentage={requestProgress}
 								/>
+								{showBulkProgress && (
+									<ProgressRow
+										label="File progress"
+										value={bulkProgress.completedFiles}
+										total={bulkProgress.totalFiles}
+										percentage={fileProgress}
+									/>
+								)}
 							</div>
 
 							<p className="mt-4 text-sm text-slate-500">
-								Currently processing request{" "}
-								<span className="font-semibold text-slate-700">
-									{progress.activeRequest || 0}
-								</span>{" "}
-								of{" "}
-								<span className="font-semibold text-slate-700">
-									{progress.totalRequests}
-								</span>
-								.
+								{showBulkProgress ? (
+									<>
+										File{" "}
+										<span className="font-semibold text-slate-700">
+											{activeFileNumber || 0}
+										</span>{" "}
+										of{" "}
+										<span className="font-semibold text-slate-700">
+											{bulkProgress.totalFiles}
+										</span>{" "}
+										- request{" "}
+										<span className="font-semibold text-slate-700">
+											{progress.activeRequest || 0}
+										</span>{" "}
+										of{" "}
+										<span className="font-semibold text-slate-700">
+											{progress.totalRequests}
+										</span>
+										.
+									</>
+								) : (
+									<>
+										Currently processing request{" "}
+										<span className="font-semibold text-slate-700">
+											{progress.activeRequest || 0}
+										</span>{" "}
+										of{" "}
+										<span className="font-semibold text-slate-700">
+											{progress.totalRequests}
+										</span>
+										.
+									</>
+								)}
 							</p>
+
+							{showBulkProgress && (
+								<div className="mt-4 rounded-2xl border border-slate-200 bg-white">
+									<div className="border-b border-slate-100 px-4 py-3">
+										<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+											File queue status
+										</p>
+									</div>
+									<ul className="max-h-52 divide-y divide-slate-100 overflow-y-auto">
+										{fileResults.map((result, index) => (
+											<li
+												key={`${result.filename}:${index}`}
+												className="flex items-center justify-between gap-3 px-4 py-2.5"
+											>
+												<p className="truncate text-sm font-medium text-slate-700">
+													{result.filename}
+												</p>
+												<span
+													title={
+														result.status === "failed" ? result.error || "" : ""
+													}
+													className={classNames(
+														"shrink-0 rounded-full border px-2.5 py-1 text-xs font-semibold",
+														getFileStatusClasses(result.status),
+													)}
+												>
+													{getFileStatusLabel(result.status)}
+												</span>
+											</li>
+										))}
+									</ul>
+								</div>
+							)}
 						</section>
 
 						<section className="rounded-3xl border border-slate-200 bg-white/85 p-6 shadow-xl backdrop-blur md:p-8">
@@ -805,70 +1165,189 @@ export default function Home() {
 				)}
 
 				{configOk === true && status === "done" && (
-					<section className="rounded-3xl border border-slate-200 bg-white/90 p-6 shadow-xl md:p-8">
-						<div className="grid gap-5 md:grid-cols-[1.3fr_0.7fr] md:items-center">
-							<div>
-								<p className="text-xs font-semibold uppercase tracking-wide text-emerald-600">
-									{activeMode === "translate"
-										? "Translation complete"
-										: "Time offset applied"}
-								</p>
-								<h2 className="mt-2 text-2xl font-bold text-slate-900 md:text-3xl">
-									{activeMode === "translate"
-										? "Your translated subtitle file has been downloaded."
-										: "Your time-adjusted subtitle file has been downloaded."}
-								</h2>
-								<p className="mt-3 text-sm text-slate-600">
-									{activeMode === "translate"
-										? "Use the action buttons to run another translation or edit your SRT file before continuing."
-										: "Use the action buttons to process another file or edit your SRT file."}
-								</p>
-								<div className="mt-4 flex flex-wrap gap-2">
-									{activeFilename && (
-										<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
-											File: {activeFilename}
-										</span>
-									)}
-									{activeMode === "translate" && activeLanguage && (
-										<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
-											Language: {activeLanguage}
-										</span>
-									)}
-									{activeMode === "offset" && activeOffsetMs !== 0 && (
-										<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
-											Offset: {activeOffsetMs > 0 ? "+" : ""}
-											{activeOffsetMs} ms
-										</span>
-									)}
-									{activeMode === "translate" && (
-										<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
-											Duration: {formatElapsedTime(elapsedSeconds)}
-										</span>
-									)}
-								</div>
-							</div>
+					<>
+						{activeMode === "translate" && showBulkProgress ? (
+							<section className="rounded-3xl border border-slate-200 bg-white/90 p-6 shadow-xl md:p-8">
+								<div className="grid gap-6 lg:grid-cols-[1.35fr_0.65fr]">
+									<div>
+										<p className="text-xs font-semibold uppercase tracking-wide text-emerald-600">
+											{failureCount
+												? `Bulk translation finished with ${failureCount} failure(s)`
+												: "Bulk translation complete"}
+										</p>
+										<h2 className="mt-2 text-2xl font-bold text-slate-900 md:text-3xl">
+											{failureCount
+												? "Successful files were packaged. Failed files are listed below."
+												: "All queued subtitle files were translated and downloaded as a ZIP."}
+										</h2>
+										<p className="mt-3 text-sm text-slate-600">
+											Review file outcomes, download the archive again, or retry only failed files.
+										</p>
 
-							<div className="flex flex-col gap-3">
-								<button
-									type="button"
-									onClick={resetToIdle}
-									className="inline-flex items-center justify-center rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800"
-								>
-									{activeMode === "translate"
-										? "Translate another file"
-										: "Process another file"}
-								</button>
-								<a
-									href="https://www.veed.io/subtitle-tools/edit?locale=en&source=/tools/subtitle-editor/srt-editor"
-									target="_blank"
-									rel="noreferrer"
-									className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
-								>
-									Open SRT editor
-								</a>
-							</div>
-						</div>
-					</section>
+										<div className="mt-4 flex flex-wrap gap-2">
+											<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+												Files: {successCount}/{fileResults.length} succeeded
+											</span>
+											{activeLanguage && (
+												<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+													Language: {activeLanguage}
+												</span>
+											)}
+											<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+												Duration: {formatElapsedTime(elapsedSeconds)}
+											</span>
+										</div>
+
+										<div className="mt-5 overflow-x-auto rounded-2xl border border-slate-200">
+											<table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+												<thead className="bg-slate-50">
+													<tr>
+														<th className="px-4 py-3 font-semibold text-slate-600">
+															Filename
+														</th>
+														<th className="px-4 py-3 font-semibold text-slate-600">
+															Status
+														</th>
+														<th className="px-4 py-3 font-semibold text-slate-600">
+															Error
+														</th>
+													</tr>
+												</thead>
+												<tbody className="divide-y divide-slate-100 bg-white">
+													{fileResults.map((result, index) => (
+														<tr key={`${result.filename}:${index}`}>
+															<td className="max-w-xs px-4 py-3 font-medium text-slate-700">
+																<span className="block truncate">{result.filename}</span>
+															</td>
+															<td className="px-4 py-3">
+																<span
+																	className={classNames(
+																		"inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold",
+																		getFileStatusClasses(result.status),
+																	)}
+																>
+																	{getFileStatusLabel(result.status)}
+																</span>
+															</td>
+															<td className="px-4 py-3 text-slate-500">
+																{result.status === "failed" ? result.error || "-" : "-"}
+															</td>
+														</tr>
+													))}
+												</tbody>
+											</table>
+										</div>
+									</div>
+
+									<div className="flex flex-col gap-3">
+										{zipDownload && (
+											<button
+												type="button"
+												onClick={() =>
+													triggerFileDownloadFromUrl(
+														zipDownload.filename,
+														zipDownload.url,
+													)
+												}
+												className="inline-flex items-center justify-center rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800"
+											>
+												Download ZIP again
+											</button>
+										)}
+										{failureCount > 0 && (
+											<button
+												type="button"
+												onClick={handleRetryFailed}
+												className="inline-flex items-center justify-center rounded-xl border border-rose-300 bg-rose-50 px-4 py-2.5 text-sm font-semibold text-rose-700 transition hover:bg-rose-100"
+											>
+												Retry failed ({failureCount})
+											</button>
+										)}
+										<button
+											type="button"
+											onClick={resetToIdle}
+											className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+										>
+											Translate another batch
+										</button>
+										<a
+											href="https://www.veed.io/subtitle-tools/edit?locale=en&source=/tools/subtitle-editor/srt-editor"
+											target="_blank"
+											rel="noreferrer"
+											className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+										>
+											Open SRT editor
+										</a>
+									</div>
+								</div>
+							</section>
+						) : (
+							<section className="rounded-3xl border border-slate-200 bg-white/90 p-6 shadow-xl md:p-8">
+								<div className="grid gap-5 md:grid-cols-[1.3fr_0.7fr] md:items-center">
+									<div>
+										<p className="text-xs font-semibold uppercase tracking-wide text-emerald-600">
+											{activeMode === "translate"
+												? "Translation complete"
+												: "Time offset applied"}
+										</p>
+										<h2 className="mt-2 text-2xl font-bold text-slate-900 md:text-3xl">
+											{activeMode === "translate"
+												? "Your translated subtitle file has been downloaded."
+												: "Your time-adjusted subtitle file has been downloaded."}
+										</h2>
+										<p className="mt-3 text-sm text-slate-600">
+											{activeMode === "translate"
+												? "Use the action buttons to run another translation or edit your SRT file before continuing."
+												: "Use the action buttons to process another file or edit your SRT file."}
+										</p>
+										<div className="mt-4 flex flex-wrap gap-2">
+											{activeFilename && (
+												<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+													File: {activeFilename}
+												</span>
+											)}
+											{activeMode === "translate" && activeLanguage && (
+												<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+													Language: {activeLanguage}
+												</span>
+											)}
+											{activeMode === "offset" && activeOffsetMs !== 0 && (
+												<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+													Offset: {activeOffsetMs > 0 ? "+" : ""}
+													{activeOffsetMs} ms
+												</span>
+											)}
+											{activeMode === "translate" && (
+												<span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+													Duration: {formatElapsedTime(elapsedSeconds)}
+												</span>
+											)}
+										</div>
+									</div>
+
+									<div className="flex flex-col gap-3">
+										<button
+											type="button"
+											onClick={resetToIdle}
+											className="inline-flex items-center justify-center rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800"
+										>
+											{activeMode === "translate"
+												? "Translate another file"
+												: "Process another file"}
+										</button>
+										<a
+											href="https://www.veed.io/subtitle-tools/edit?locale=en&source=/tools/subtitle-editor/srt-editor"
+											target="_blank"
+											rel="noreferrer"
+											className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+										>
+											Open SRT editor
+										</a>
+									</div>
+								</div>
+							</section>
+						)}
+					</>
 				)}
 			</div>
 		</main>
